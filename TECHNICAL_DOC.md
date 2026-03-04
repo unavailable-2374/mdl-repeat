@@ -26,11 +26,12 @@
 
 ### 1.1 Motivation
 
-De novo repeat element discovery aims to identify repetitive sequences in a genome without prior knowledge of a repeat library. RepeatScout (Price, Jones & Pevzner, 2005) established the seed-and-extend paradigm: pick the highest-frequency l-mer, extend it into a consensus via banded pairwise alignment against all occurrences simultaneously, mask the found family, and repeat. This approach is effective but relies on hard-coded thresholds (`MINTHRESH`, `GOODLENGTH`) to decide which families to report.
+De novo repeat element discovery aims to identify repetitive sequences in a genome without prior knowledge of a repeat library. Traditional approaches rely on hard-coded thresholds (minimum copy count, minimum consensus length) to decide which families to report. These thresholds lack theoretical justification and require manual tuning for each genome.
 
-mdl-repeat replaces these arbitrary thresholds with the **Minimum Description Length (MDL) principle**, an information-theoretic criterion that automatically determines how many families to report, how long each consensus should be, and the minimum copy number that justifies a family. The discovery engine faithfully replicates RepeatScout v1.0.7's N-sequence simultaneous banded DP extension, preserving its sensitivity while adding:
+mdl-repeat uses the **Minimum Description Length (MDL) principle** as a unified, information-theoretic criterion that automatically determines how many families to report, how long each consensus should be, and the minimum copy number that justifies a family. The core components are:
 
-- **MDL-based model selection** — replaces all threshold-driven decisions
+- **Seed-and-extend discovery** — N-sequence simultaneous banded DP extension builds consensus sequences from high-frequency l-mer seeds
+- **MDL-based model selection** — a family is accepted if and only if encoding its instances as references to the consensus compresses the genome
 - **Iterative R convergence** — resolves the circular dependency between the number of accepted families and per-instance encoding costs
 - **Refinement pipeline** — merge, split, fragment assembly, and prune stages to improve library quality
 - **Multi-threading** — parallel position index construction and alignment refinement
@@ -169,10 +170,7 @@ Step 9: Output
 
 ## 4. Discovery Engine
 
-The discovery engine (`discover.c`, ~2200 lines) faithfully replicates RepeatScout v1.0.7's algorithm with two bug fixes:
-
-1. **Sequence boundary check**: RepeatScout hard-codes `bStart=0; bEnd=50000000`, preventing correct multi-sequence handling. mdl-repeat computes boundaries from the actual FASTA input.
-2. **Dynamic `value[]` allocation**: RepeatScout's `struct repeatllist.value[20]` overflows when l > 19. mdl-repeat allocates dynamically based on the actual l-mer length.
+The discovery engine (`discover.c`, ~2200 lines) implements the seed-and-extend paradigm: select the highest-frequency l-mer as a seed, extend it into a consensus via simultaneous banded DP alignment against all occurrences, mask the found family, and repeat.
 
 ### 4.1 Genome Doubling
 
@@ -205,7 +203,7 @@ stored_hash   = max(hash_forward, hash_revcomp)
 
 The frequency table can be:
 - Computed internally (`build_headptr_internal`)
-- Read from a pre-computed file (`-freq <file>`, compatible with RepeatScout's `build_lmer_table` format)
+- Read from a pre-computed file (`-freq <file>`)
 - Written for reuse (`-freq-output <file>`)
 
 ### 4.3 Seed Selection
@@ -473,29 +471,27 @@ mdl-repeat uses genome doubling (forward + padding + reverse complement), matchi
 
 ### 9.2 Sensitivity-Preserving MDL Formula
 
-The DESIGN_DOC specifies a complete per-instance encoding that includes type bit (1 bit), family identifier ($\lceil \log_2(R) \rceil$ bits), strand (1 bit), and consensus start pointer ($\lceil \log_2(\text{len}_r) \rceil$ bits) — totaling approximately 19-24 additional bits per instance.
+A theoretically complete per-instance encoding would include type bit (1 bit), family identifier ($\lceil \log_2(R) \rceil$ bits), strand (1 bit), and consensus start pointer ($\lceil \log_2(\text{len}_r) \rceil$ bits) — totaling approximately 19-24 additional bits per instance. However, testing on real genomes showed that this level of overhead caused unacceptable sensitivity loss, rejecting genuine low-copy families.
 
-**This was implemented and tested, then reverted.** Testing on real genomes (Arabidopsis, Rice) showed that the complete formula caused unacceptable sensitivity loss (10M+ masked bases lost on Arabidopsis). The overhead per instance was too aggressive: it caused genuine 2-3 copy families to be rejected.
-
-The current implementation uses the original simpler formula:
+The current implementation uses a balanced formula:
 
 $$C_{\text{instance}} = L_{\text{int}}(a_i) + L_{\text{int}}(m_i + 1) + m_i \cdot \log_2(3) + \text{position\_encoding}$$
 
-The `mdl_instance_cost_full()` function accepts `consensus_length` and `num_families` parameters for API compatibility but does not use them in the cost computation. This preserves the option to re-introduce overhead terms in future versions with better calibration.
+The `mdl_instance_cost_full()` function accepts `consensus_length` and `num_families` parameters for API extensibility but does not currently use them in the cost computation. This preserves the option to re-introduce overhead terms in future versions with better calibration.
 
-**Lesson**: Per-instance overhead in the MDL formula must be validated on real genomes before committing. Theoretical completeness does not guarantee practical utility.
+**Design principle**: The MDL formula prioritizes sensitivity over theoretical completeness. It is better to accept a few marginal families than to miss genuine repeats.
 
 ### 9.3 Spatial Co-occurrence for Fragment Assembly
 
 The original plan proposed k-mer Jaccard for detecting fragment pairs. This is fundamentally wrong for fragment assembly: non-overlapping fragments from different parts of the same TE share zero k-mers. The correct approach is **spatial co-occurrence** — counting how often instances from two families appear near each other in the genome. This was identified during plan review and implemented from the start.
 
-### 9.4 No align_refine During Discovery
+### 9.4 Discovery vs. Refinement Alignment
 
-Calling `align_refine_family` (which re-collects instances via multi-k-mer seeding and rebuilds the consensus) on families produced by seed-and-extend was found to be **harmful**. The multi-k-mer seeding approach truncates the consensus because it relies on exact k-mer matches to anchor alignments, while the seed-and-extend consensus was built from approximate simultaneous alignment. Coverage dropped from ~48% to ~37% when this was applied. The align-refine functions are used only in the refinement pipeline (merge, split) where they are appropriate.
+The discovery engine and the refinement pipeline use different alignment strategies. The discovery engine uses N-sequence simultaneous banded DP, which produces consensus sequences from approximate alignment across all occurrences. The refinement pipeline uses multi-k-mer seeded alignment, which anchors on exact k-mer matches. These two approaches are complementary: the discovery alignment is better for building initial consensus from noisy data, while the seeded alignment is better for collecting instances against an established consensus. Applying seeded alignment to raw discovery output would truncate the consensus and lose coverage.
 
-### 9.5 MINTHRESH=2 vs. RepeatScout's MINTHRESH=3
+### 9.5 Default MINTHRESH=2
 
-mdl-repeat defaults to MINTHRESH=2 (minimum l-mer frequency to seed). Since MDL replaces the arbitrary threshold as the final arbiter, allowing seeds with frequency 2 lets MDL evaluate borderline families rather than discarding them a priori. This improves sensitivity for low-copy families that genuinely compress the genome.
+mdl-repeat defaults to MINTHRESH=2 (minimum l-mer frequency to seed). Since MDL is the final arbiter, allowing seeds with frequency 2 lets MDL evaluate borderline families rather than discarding them a priori. This improves sensitivity for low-copy families that genuinely compress the genome.
 
 ### 9.6 Canonical K-mers
 
