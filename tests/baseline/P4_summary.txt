@@ -1,0 +1,49 @@
+P4 Final Results (post-optimization, mdl-mode=exact)
+=====================================================
+Date: 2026-03-02
+
+Test Results: 7 PASS, 0 FAIL
+
+Test A (1MB, multiple families):
+  Families accepted: 7 / 18 (baseline: 7 / 16)
+  Bases covered: 41030 / 1011000 (4.1%)  [baseline: 40902 (4.0%)]
+  Predicted bases: 68233 [baseline: 63667]
+
+Test B (100KB, tandem):
+  Families accepted: 0 / 0 (unchanged — known MVP limitation)
+
+Test C (200KB, detection limit):
+  Families accepted: 1 / 5 (baseline: 1 / 5)
+  Bases covered: 881 / 211000 (0.4%) [baseline: same]
+
+Test D (500KB, nested TE):
+  Families accepted: 1 / 10 (baseline: 2 / 8)
+  Bases covered: 14954 / 511000 (2.9%) [baseline: 14971 (2.9%)]
+
+Human3M:
+  Families accepted: 361 / 541 (baseline: 289 / 367)
+  Bases covered: 1037188 / 3011000 (34.4%) [baseline: 1023013 (34.0%)]
+  Compression ratio: -0.2676 [baseline: -0.0961]
+
+Performance:
+  Wall clock: 44.40s [baseline: 19.25s] (expected: MAX_ITERATIONS 3→10 ~2x)
+  Peak memory: 401784 KB (~393 MB) [baseline: 320460 KB (~313 MB)]
+
+Comparison vs Baseline (QC):
+  Human3M families: 361 vs 289 = 124.9% (>= 70% threshold: PASS)
+  Human3M bases:    1037188 vs 1023013 = 101.4% (>= 80% threshold: PASS)
+  TestA families:   7 vs 7 = 100.0% (PASS)
+  TestA bases:      41030 vs 40902 = 100.3% (PASS)
+
+Changes Applied:
+  P0: -mdl-mode switch (none/exact/upper), baseline captured
+  P1.1+P1.2: Bug #1 (m_i<=0 → m_i<0) + C1 lgamma exact binomial
+  P1.3: Bug #2 left extension chunk reversal fix
+  P1.4: mdl.h documentation corrected
+  P2.1: MAXOFFSET 5 → 12 (bandwidth 11 → 25)
+  P2.2: MAX_ITERATIONS 3 → 10 (convergence-limited)
+  P2.3: Valley depth protection for Otsu split
+  P3: DAG topological sort — DEFERRED (only 1.63% of runtime)
+  P4.1: Sorted overlap detection (>500 instances)
+  P4.2: KmerEntry memory pool (4096-entry blocks)
+  P4.3: -march=native -flto + PORTABLE=1 option

@@ -1,0 +1,21 @@
+# Build artifacts
+obj/
+bin/
+
+# Editor/IDE
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Claude Code internal
+.claude/
+CLAUDE.md
+
+# Test results (generated, not tracked)
+tests/results/
+
+# OS
+.DS_Store
+Thumbs.db

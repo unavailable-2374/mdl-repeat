@@ -1,0 +1,89 @@
+=== MDL-Repeat Test Suite ===
+
+--- Building ---
+rm -rf obj bin
+gcc -O3 -Wall -Wextra -std=c11 -pthread -o bin/mdl-repeat obj/align.o obj/candidates.o obj/cmd_line_opts.o obj/genome.o obj/graph.o obj/kmer.o obj/main.o obj/mdl.o obj/output.o obj/refine.o -lm -pthread
+  [0;32mPASS[0m: Build succeeds with zero warnings
+
+--- Generating synthetic test data ---
+Test A: 1000000 bp genome, 170 repeat instances
+Test B: 100000 bp genome, tandem array of 15x50bp
+Test C: 200000 bp genome, detection limit test
+Test D: 500000 bp genome, nested TE test
+
+All test data written to /home/shuoc/tool/mdl-repeat/tests/data/
+
+--- L_int unit tests ---
+L_int test vectors:
+  L_int(1) = 1.518 (expected 1.518) PASS
+  L_int(2) = 2.518 (expected 2.518) PASS
+  L_int(3) = 3.767 (expected 3.768) PASS
+  L_int(10) = 7.364 (expected 7.364) PASS
+  L_int(100) = 12.880 (expected 12.880) PASS
+
+5/5 tests passed
+L_int test vectors:
+  L_int(1) = 1.518 (expected 1.518) PASS
+  L_int(2) = 2.518 (expected 2.518) PASS
+  L_int(3) = 3.767 (expected 3.768) PASS
+  L_int(10) = 7.364 (expected 7.364) PASS
+  L_int(100) = 12.880 (expected 12.880) PASS
+
+5/5 tests passed
+  [0;32mPASS[0m: L_int test vectors
+
+--- Test A: Multiple families (1MB genome) ---
+  Accepted families:    7 / 16
+  Bases covered:        40902 / 1011000 (4.0%)
+  [0;32mPASS[0m: Test A: found families (>= 1)
+  [0;32mPASS[0m: Test A: found instances (>= 50)
+  Truth repeat bases: 40000, Predicted repeat bases: 63667
+
+--- Test B: Tandem array (MVP limitation: may not detect short tandems) ---
+  Accepted families:    0 / 0
+  Bases covered:        0 / 111000 (0.0%)
+  [1;33mINFO[0m: Test B found 0
+0 families (50bp tandem units near detection limit)
+
+--- Test C: Detection limit (3 copies @ 0% vs 2 copies @ 20%) ---
+  Accepted families:    1 / 5
+  Bases covered:        881 / 211000 (0.4%)
+  [0;32mPASS[0m: Test C: found at least 1 family
+
+--- Test D: Nested TE (SINE inside LINE) ---
+  Accepted families:    2 / 8
+  Bases covered:        14971 / 511000 (2.9%)
+  [0;32mPASS[0m: Test D: found families (>= 1)
+
+--- Human3M smoke test ---
+  Accepted families:    289 / 367
+  Bases covered:        1023013 / 3011000 (34.0%)
+  Compression ratio:    -0.0961
+  [0;32mPASS[0m: Human3M: found families (>= 10)
+
+===========================
+Results: [0;32m7 PASS[0m, [0;31m0 FAIL[0m
+===========================
+	Command being timed: "bash tests/run_tests.sh"
+	User time (seconds): 17.30
+	System time (seconds): 1.89
+	Percent of CPU this job got: 99%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:19.25
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 320460
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 21
+	Minor (reclaiming a frame) page faults: 692774
+	Voluntary context switches: 799
+	Involuntary context switches: 490
+	Swaps: 0
+	File system inputs: 24584
+	File system outputs: 9656
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

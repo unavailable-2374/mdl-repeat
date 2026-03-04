@@ -1,0 +1,32 @@
+P0 Baseline Summary (pre-optimization)
+=======================================
+Date: 2026-03-02
+Commit: pre-optimization baseline
+
+Test Results: 7 PASS, 0 FAIL
+
+Test A (1MB, multiple families):
+  Families accepted: 7 / 16
+  Bases covered: 40902 / 1011000 (4.0%)
+  Truth bases: 40000, Predicted bases: 63667
+
+Test B (100KB, tandem):
+  Families accepted: 0 / 0 (known MVP limitation)
+
+Test C (200KB, detection limit):
+  Families accepted: 1 / 5
+  Bases covered: 881 / 211000 (0.4%)
+
+Test D (500KB, nested TE):
+  Families accepted: 2 / 8
+  Bases covered: 14971 / 511000 (2.9%)
+
+Human3M:
+  Families accepted: 289 / 367
+  Bases covered: 1023013 / 3011000 (34.0%)
+  Compression ratio: -0.0961
+
+Performance:
+  Wall clock: 19.25s
+  User time: 17.30s
+  Peak memory: 320460 KB (~313 MB)
