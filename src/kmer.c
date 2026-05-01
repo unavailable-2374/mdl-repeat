@@ -21,16 +21,41 @@ typedef struct {
 
 static KmerPool g_kmer_pool = { NULL, POOL_BLOCK_SIZE };
 
-static KmerEntry *pool_alloc(void)
+/* Allocate a KmerEntry from a given pool (thread-local or global) */
+static KmerEntry *pool_alloc_local(KmerPool *pool)
 {
-    if (g_kmer_pool.next_idx >= POOL_BLOCK_SIZE) {
+    if (pool->next_idx >= POOL_BLOCK_SIZE) {
         KmerPoolBlock *blk = malloc(sizeof(KmerPoolBlock));
         if (!blk) return NULL;
-        blk->next = g_kmer_pool.head;
-        g_kmer_pool.head = blk;
-        g_kmer_pool.next_idx = 0;
+        blk->next = pool->head;
+        pool->head = blk;
+        pool->next_idx = 0;
     }
-    return &g_kmer_pool.head->entries[g_kmer_pool.next_idx++];
+    return &pool->head->entries[pool->next_idx++];
+}
+
+/* Allocate from the global pool (sequential path) */
+static KmerEntry *pool_alloc(void)
+{
+    return pool_alloc_local(&g_kmer_pool);
+}
+
+/* Merge a thread-local pool's block list into the global pool for unified cleanup.
+ * After this call the thread pool is empty (head=NULL). */
+static void pool_merge(KmerPool *thread_pool)
+{
+    if (!thread_pool->head) return;
+
+    /* Walk to the tail of the thread pool's block list */
+    KmerPoolBlock *tail = thread_pool->head;
+    while (tail->next) tail = tail->next;
+
+    /* Splice: thread-tail -> global-head */
+    tail->next = g_kmer_pool.head;
+    g_kmer_pool.head = thread_pool->head;
+
+    thread_pool->head = NULL;
+    thread_pool->next_idx = POOL_BLOCK_SIZE;
 }
 
 static void pool_free_all(void)
@@ -101,7 +126,94 @@ static inline size_t kmer_hash(uint64_t kmer, size_t table_size)
 
 /* --- Hash table operations --- */
 
-KmerTable *kmer_count(const Genome *g, int k, int tandemdist)
+/* --- Parallel k-mer counting infrastructure --- */
+
+#define NUM_STRIPES 4096
+
+typedef struct {
+    const Genome   *g;
+    KmerTable      *kt;
+    int             k;
+    int             tandemdist;
+    glen_t          chunk_start;
+    glen_t          chunk_end;
+    KmerPool        local_pool;      /* per-thread pool */
+    pthread_mutex_t *stripe_locks;   /* shared stripe lock array */
+    int             failed;          /* set to 1 on OOM */
+} KmerCountWorkerArgs;
+
+static void *kmer_count_worker(void *arg)
+{
+    KmerCountWorkerArgs *a = (KmerCountWorkerArgs *)arg;
+    int k = a->k;
+    int tandemdist = a->tandemdist;
+    KmerTable *kt = a->kt;
+    size_t table_size = kt->table_size;
+
+    for (glen_t i = a->chunk_start; i < a->chunk_end; i++) {
+        uint64_t fwd = kmer_pack(a->g->sequence + i, k);
+        if (fwd == UINT64_MAX)
+            continue;
+
+        uint64_t rc = kmer_revcomp(fwd, k);
+        uint64_t canon = (fwd <= rc) ? fwd : rc;
+        int is_reverse = (fwd > rc);
+
+        size_t h = kmer_hash(canon, table_size);
+        size_t stripe = h % NUM_STRIPES;
+
+        pthread_mutex_lock(&a->stripe_locks[stripe]);
+
+        /* Search for existing entry (under lock) */
+        KmerEntry *entry = kt->buckets[h];
+        while (entry != NULL) {
+            if (entry->kmer == canon)
+                break;
+            entry = entry->next;
+        }
+
+        if (entry != NULL) {
+            /* Existing k-mer: apply TANDEMDIST filtering */
+            if (is_reverse) {
+                if ((gpos_t)i - entry->last_minus_occ >= tandemdist)
+                    entry->frequency++;
+                entry->last_minus_occ = (gpos_t)i;
+            } else {
+                if ((gpos_t)i - entry->last_plus_occ >= tandemdist)
+                    entry->frequency++;
+                entry->last_plus_occ = (gpos_t)i;
+            }
+        } else {
+            /* New k-mer: allocate from thread-local pool */
+            entry = pool_alloc_local(&a->local_pool);
+            if (entry == NULL) {
+                pthread_mutex_unlock(&a->stripe_locks[stripe]);
+                a->failed = 1;
+                return NULL;
+            }
+            entry->kmer = canon;
+            entry->frequency = 1;
+            if (is_reverse) {
+                entry->last_plus_occ = -1000000;
+                entry->last_minus_occ = (gpos_t)i;
+            } else {
+                entry->last_plus_occ = (gpos_t)i;
+                entry->last_minus_occ = -1000000;
+            }
+            entry->positions = NULL;
+            entry->num_positions = 0;
+            entry->cap_positions = 0;
+            entry->next = kt->buckets[h];
+            kt->buckets[h] = entry;
+            __atomic_fetch_add(&kt->num_entries, 1, __ATOMIC_RELAXED);
+        }
+
+        pthread_mutex_unlock(&a->stripe_locks[stripe]);
+    }
+    return NULL;
+}
+
+KmerTable *kmer_count(const Genome *g, int k, int tandemdist, int num_threads)
 {
     if (k > 31) {
         fprintf(stderr, "kmer_count: k=%d exceeds maximum 31 (64-bit packing limit)\n", k);
@@ -129,70 +241,152 @@ KmerTable *kmer_count(const Genome *g, int k, int tandemdist)
         return NULL;
     }
 
-    /* Single-pass counting with TANDEMDIST filtering */
     glen_t end = g->length - k + 1;
 
-    for (glen_t i = PADLENGTH; i < end; i++) {
-        /* Progress indicator */
-        if (i % 500000 == 0)
-            fprintf(stderr, "  kmer counting: %" PRId64 " / %" PRId64 " (%.0f%%)\r",
-                    (int64_t)(i - PADLENGTH), (int64_t)(end - PADLENGTH),
-                    100.0 * (double)(i - PADLENGTH) / (double)(end - PADLENGTH));
+    if (num_threads <= 1) {
+        /* ---- Sequential path (unchanged) ---- */
+        for (glen_t i = PADLENGTH; i < end; i++) {
+            /* Progress indicator */
+            if (i % 500000 == 0)
+                fprintf(stderr, "  kmer counting: %" PRId64 " / %" PRId64 " (%.0f%%)\r",
+                        (int64_t)(i - PADLENGTH), (int64_t)(end - PADLENGTH),
+                        100.0 * (double)(i - PADLENGTH) / (double)(end - PADLENGTH));
 
-        /* Pack the k-mer at position i */
-        uint64_t fwd = kmer_pack(g->sequence + i, k);
-        if (fwd == UINT64_MAX)
-            continue; /* contains N */
+            /* Pack the k-mer at position i */
+            uint64_t fwd = kmer_pack(g->sequence + i, k);
+            if (fwd == UINT64_MAX)
+                continue; /* contains N */
 
-        uint64_t rc = kmer_revcomp(fwd, k);
-        uint64_t canon = (fwd <= rc) ? fwd : rc;
-        int is_reverse = (fwd > rc);  /* this occurrence is reverse-strand */
+            uint64_t rc = kmer_revcomp(fwd, k);
+            uint64_t canon = (fwd <= rc) ? fwd : rc;
+            int is_reverse = (fwd > rc);  /* this occurrence is reverse-strand */
 
-        size_t h = kmer_hash(canon, kt->table_size);
+            size_t h = kmer_hash(canon, kt->table_size);
 
-        /* Search for existing entry */
-        KmerEntry *entry = kt->buckets[h];
-        while (entry != NULL) {
-            if (entry->kmer == canon)
-                break;
-            entry = entry->next;
+            /* Search for existing entry */
+            KmerEntry *entry = kt->buckets[h];
+            while (entry != NULL) {
+                if (entry->kmer == canon)
+                    break;
+                entry = entry->next;
+            }
+
+            if (entry != NULL) {
+                /* Existing k-mer: apply TANDEMDIST filtering */
+                if (is_reverse) {
+                    if ((gpos_t)i - entry->last_minus_occ >= tandemdist)
+                        entry->frequency++;
+                    entry->last_minus_occ = (gpos_t)i;
+                } else {
+                    if ((gpos_t)i - entry->last_plus_occ >= tandemdist)
+                        entry->frequency++;
+                    entry->last_plus_occ = (gpos_t)i;
+                }
+            } else {
+                /* New k-mer (pool-allocated) */
+                entry = pool_alloc();
+                if (entry == NULL) {
+                    fprintf(stderr, "kmer_count: out of memory at position %" PRId64 "\n",
+                            (int64_t)i);
+                    kmer_free(kt);
+                    return NULL;
+                }
+                entry->kmer = canon;
+                entry->frequency = 1;
+                if (is_reverse) {
+                    entry->last_plus_occ = -1000000;
+                    entry->last_minus_occ = (gpos_t)i;
+                } else {
+                    entry->last_plus_occ = (gpos_t)i;
+                    entry->last_minus_occ = -1000000;
+                }
+                entry->positions = NULL;
+                entry->num_positions = 0;
+                entry->cap_positions = 0;
+                entry->next = kt->buckets[h];
+                kt->buckets[h] = entry;
+                kt->num_entries++;
+            }
+        }
+    } else {
+        /* ---- Parallel path: striped mutex locks + per-thread pools ---- */
+        fprintf(stderr, "  kmer counting: parallel with %d threads, %d stripe locks\n",
+                num_threads, NUM_STRIPES);
+
+        /* Allocate and initialize stripe locks */
+        pthread_mutex_t *stripe_locks = malloc(NUM_STRIPES * sizeof(pthread_mutex_t));
+        if (!stripe_locks) {
+            fprintf(stderr, "kmer_count: out of memory for stripe locks\n");
+            kmer_free(kt);
+            return NULL;
+        }
+        for (int s = 0; s < NUM_STRIPES; s++)
+            pthread_mutex_init(&stripe_locks[s], NULL);
+
+        /* Set up per-thread arguments */
+        glen_t range = end - PADLENGTH;
+        KmerCountWorkerArgs *args = calloc((size_t)num_threads,
+                                           sizeof(KmerCountWorkerArgs));
+        pthread_t *threads = malloc((size_t)num_threads * sizeof(pthread_t));
+        if (!args || !threads) {
+            free(args); free(threads);
+            for (int s = 0; s < NUM_STRIPES; s++)
+                pthread_mutex_destroy(&stripe_locks[s]);
+            free(stripe_locks);
+            fprintf(stderr, "kmer_count: out of memory for thread args\n");
+            kmer_free(kt);
+            return NULL;
         }
 
-        if (entry != NULL) {
-            /* Existing k-mer: apply TANDEMDIST filtering */
-            if (is_reverse) {
-                if ((gpos_t)i - entry->last_minus_occ >= tandemdist)
-                    entry->frequency++;
-                entry->last_minus_occ = (gpos_t)i;
-            } else {
-                if ((gpos_t)i - entry->last_plus_occ >= tandemdist)
-                    entry->frequency++;
-                entry->last_plus_occ = (gpos_t)i;
-            }
-        } else {
-            /* New k-mer (pool-allocated) */
-            entry = pool_alloc();
-            if (entry == NULL) {
-                fprintf(stderr, "kmer_count: out of memory at position %" PRId64 "\n",
-                        (int64_t)i);
-                kmer_free(kt);
-                return NULL;
-            }
-            entry->kmer = canon;
-            entry->frequency = 1;
-            if (is_reverse) {
-                entry->last_plus_occ = -1000000;
-                entry->last_minus_occ = (gpos_t)i;
-            } else {
-                entry->last_plus_occ = (gpos_t)i;
-                entry->last_minus_occ = -1000000;
-            }
-            entry->positions = NULL;
-            entry->num_positions = 0;
-            entry->cap_positions = 0;
-            entry->next = kt->buckets[h];
-            kt->buckets[h] = entry;
-            kt->num_entries++;
+        for (int t = 0; t < num_threads; t++) {
+            args[t].g = g;
+            args[t].kt = kt;
+            args[t].k = k;
+            args[t].tandemdist = tandemdist;
+            args[t].chunk_start = PADLENGTH + range * t / num_threads;
+            args[t].chunk_end   = PADLENGTH + range * (t + 1) / num_threads;
+            args[t].local_pool.head = NULL;
+            args[t].local_pool.next_idx = POOL_BLOCK_SIZE;
+            args[t].stripe_locks = stripe_locks;
+            args[t].failed = 0;
+        }
+
+        /* Launch worker threads */
+        int launched = 0;
+        for (int t = 0; t < num_threads; t++) {
+            if (pthread_create(&threads[t], NULL, kmer_count_worker,
+                               &args[t]) != 0)
+                break;
+            launched++;
+        }
+        /* Any threads that failed to launch: run inline */
+        for (int t = launched; t < num_threads; t++)
+            kmer_count_worker(&args[t]);
+        /* Join launched threads */
+        for (int t = 0; t < launched; t++)
+            pthread_join(threads[t], NULL);
+
+        /* Check for OOM in any thread */
+        int any_failed = 0;
+        for (int t = 0; t < num_threads; t++) {
+            if (args[t].failed) any_failed = 1;
+        }
+
+        /* Merge all thread-local pools into the global pool */
+        for (int t = 0; t < num_threads; t++)
+            pool_merge(&args[t].local_pool);
+
+        /* Destroy stripe locks */
+        for (int s = 0; s < NUM_STRIPES; s++)
+            pthread_mutex_destroy(&stripe_locks[s]);
+        free(stripe_locks);
+        free(threads);
+        free(args);
+
+        if (any_failed) {
+            fprintf(stderr, "kmer_count: out of memory in worker thread\n");
+            kmer_free(kt);
+            return NULL;
         }
     }
 
@@ -271,19 +465,22 @@ void kmer_free(KmerTable *kt)
 
 /* --- Parallel position index building --- */
 
+/*
+ * Phase 1 worker: count how many positions each k-mer has in this chunk.
+ * Writes counts into a per-thread count array indexed by a compact entry ID.
+ * No shared mutable state — fully deterministic.
+ */
 typedef struct {
     const KmerTable *kt;
     const Genome *g;
     glen_t chunk_start;
     glen_t chunk_end;
-    int64_t positions_stored;
 } PosWorkerArgs;
 
-static void *pos_worker(void *arg)
+static void *pos_count_worker(void *arg)
 {
     PosWorkerArgs *a = (PosWorkerArgs *)arg;
     int k = a->kt->k;
-    a->positions_stored = 0;
 
     for (glen_t i = a->chunk_start; i < a->chunk_end; i++) {
         uint64_t fwd = kmer_pack(a->g->sequence + i, k);
@@ -291,18 +488,12 @@ static void *pos_worker(void *arg)
 
         uint64_t rc = kmer_revcomp(fwd, k);
         uint64_t canon = (fwd <= rc) ? fwd : rc;
-        int is_reverse = (fwd > rc);
 
         KmerEntry *entry = kmer_lookup(a->kt, canon);
         if (!entry) continue;
 
-        /* Atomic claim a slot; silently drop if over capacity */
-        int32_t idx = __atomic_fetch_add(&entry->num_positions, 1,
-                                         __ATOMIC_RELAXED);
-        if (idx < entry->cap_positions) {
-            entry->positions[idx] = is_reverse ? -(gpos_t)i : (gpos_t)i;
-            a->positions_stored++;
-        }
+        /* Thread-safe: each thread only increments atomically for counting */
+        __atomic_fetch_add(&entry->num_positions, 1, __ATOMIC_RELAXED);
     }
     return NULL;
 }
@@ -314,24 +505,42 @@ void kmer_build_positions(KmerTable *kt, const Genome *g, int num_threads)
 
     fprintf(stderr, "  Building k-mer position index...\n");
 
-    /* Pre-allocate position arrays for all surviving entries.
-     * This enables lock-free parallel filling via atomic slot claiming. */
-    for (size_t h = 0; h < kt->table_size; h++) {
-        for (KmerEntry *e = kt->buckets[h]; e != NULL; e = e->next) {
-            int cap = (int)e->frequency * 6;
-            if (cap < 64) cap = 64;
-            if (cap > KMER_MAX_POSITIONS) cap = KMER_MAX_POSITIONS;
-            e->positions = malloc((size_t)cap * sizeof(gpos_t));
-            if (!e->positions) cap = 0;
-            e->cap_positions = cap;
-            e->num_positions = 0;
-        }
-    }
-
     int64_t total_positions = 0;
 
     if (num_threads <= 1) {
-        /* Sequential path */
+        /* Sequential path: single-pass count + fill */
+        for (size_t h = 0; h < kt->table_size; h++) {
+            for (KmerEntry *e = kt->buckets[h]; e != NULL; e = e->next) {
+                e->num_positions = 0;
+                e->cap_positions = 0;
+                e->positions = NULL;
+            }
+        }
+
+        /* Count pass */
+        for (glen_t i = PADLENGTH; i < end; i++) {
+            uint64_t fwd = kmer_pack(g->sequence + i, k);
+            if (fwd == UINT64_MAX) continue;
+            uint64_t canon = kmer_canonical(fwd, k);
+            KmerEntry *entry = kmer_lookup(kt, canon);
+            if (entry) entry->num_positions++;
+        }
+
+        /* Allocate */
+        for (size_t h = 0; h < kt->table_size; h++) {
+            for (KmerEntry *e = kt->buckets[h]; e != NULL; e = e->next) {
+                int cap = e->num_positions;
+                if (cap > KMER_MAX_POSITIONS) cap = KMER_MAX_POSITIONS;
+                if (cap > 0) {
+                    e->positions = malloc((size_t)cap * sizeof(gpos_t));
+                    if (!e->positions) cap = 0;
+                }
+                e->cap_positions = cap;
+                e->num_positions = 0;
+            }
+        }
+
+        /* Fill pass */
         for (glen_t i = PADLENGTH; i < end; i++) {
             if (i % 2000000 == 0)
                 fprintf(stderr, "  position index: %" PRId64 " / %" PRId64
@@ -349,7 +558,6 @@ void kmer_build_positions(KmerTable *kt, const Genome *g, int num_threads)
 
             KmerEntry *entry = kmer_lookup(kt, canon);
             if (!entry) continue;
-
             if (entry->num_positions >= entry->cap_positions) continue;
 
             entry->positions[entry->num_positions++] =
@@ -357,8 +565,28 @@ void kmer_build_positions(KmerTable *kt, const Genome *g, int num_threads)
             total_positions++;
         }
     } else {
-        /* Parallel path: divide genome into chunks */
+        /*
+         * Parallel path: two-phase approach for determinism.
+         *
+         * Phase 1: parallel count (each thread scans its genome chunk).
+         * Phase 2: sequential fill in genome-coordinate order.
+         *
+         * This ensures that when cap_positions < actual positions, the
+         * lowest-coordinate positions are always kept — deterministic
+         * regardless of thread count.
+         */
         glen_t range = end - PADLENGTH;
+
+        /* Initialize counts to zero */
+        for (size_t h = 0; h < kt->table_size; h++) {
+            for (KmerEntry *e = kt->buckets[h]; e != NULL; e = e->next) {
+                e->num_positions = 0;
+                e->cap_positions = 0;
+                e->positions = NULL;
+            }
+        }
+
+        /* Phase 1: parallel counting */
         PosWorkerArgs *args = malloc((size_t)num_threads * sizeof(PosWorkerArgs));
         pthread_t *threads = malloc((size_t)num_threads * sizeof(pthread_t));
         if (!args || !threads) {
@@ -373,36 +601,56 @@ void kmer_build_positions(KmerTable *kt, const Genome *g, int num_threads)
             args[t].g = g;
             args[t].chunk_start = PADLENGTH + range * t / num_threads;
             args[t].chunk_end = PADLENGTH + range * (t + 1) / num_threads;
-            args[t].positions_stored = 0;
         }
 
         int launched = 0;
         for (int t = 0; t < num_threads; t++) {
-            if (pthread_create(&threads[t], NULL, pos_worker, &args[t]) != 0)
+            if (pthread_create(&threads[t], NULL, pos_count_worker, &args[t]) != 0)
                 break;
             launched++;
         }
-        /* If some threads failed, process remaining chunks on main thread */
-        for (int t = launched; t < num_threads; t++) {
-            args[t].chunk_start = args[t].chunk_start; /* already set */
-            pos_worker(&args[t]);
-        }
+        for (int t = launched; t < num_threads; t++)
+            pos_count_worker(&args[t]);
         for (int t = 0; t < launched; t++)
             pthread_join(threads[t], NULL);
 
-        for (int t = 0; t < num_threads; t++)
-            total_positions += args[t].positions_stored;
+        /* Allocate position arrays based on actual counts */
+        for (size_t h = 0; h < kt->table_size; h++) {
+            for (KmerEntry *e = kt->buckets[h]; e != NULL; e = e->next) {
+                int cap = e->num_positions;
+                if (cap > KMER_MAX_POSITIONS) cap = KMER_MAX_POSITIONS;
+                if (cap > 0) {
+                    e->positions = malloc((size_t)cap * sizeof(gpos_t));
+                    if (!e->positions) cap = 0;
+                }
+                e->cap_positions = cap;
+                e->num_positions = 0;  /* reset for fill phase */
+            }
+        }
+
+        /* Phase 2: sequential fill in genome-coordinate order.
+         * This is the critical determinism guarantee: positions are
+         * inserted in ascending coordinate order, so truncation at
+         * cap_positions always keeps the same subset. */
+        for (glen_t i = PADLENGTH; i < end; i++) {
+            uint64_t fwd = kmer_pack(g->sequence + i, k);
+            if (fwd == UINT64_MAX) continue;
+
+            uint64_t rc = kmer_revcomp(fwd, k);
+            uint64_t canon = (fwd <= rc) ? fwd : rc;
+            int is_reverse = (fwd > rc);
+
+            KmerEntry *entry = kmer_lookup(kt, canon);
+            if (!entry) continue;
+            if (entry->num_positions >= entry->cap_positions) continue;
+
+            entry->positions[entry->num_positions++] =
+                is_reverse ? -(gpos_t)i : (gpos_t)i;
+            total_positions++;
+        }
 
         free(args);
         free(threads);
-
-        /* Clamp num_positions that may have overshot cap_positions */
-        for (size_t h = 0; h < kt->table_size; h++) {
-            for (KmerEntry *e = kt->buckets[h]; e != NULL; e = e->next) {
-                if (e->num_positions > e->cap_positions)
-                    e->num_positions = e->cap_positions;
-            }
-        }
     }
 
     fprintf(stderr, "  Position index: %" PRId64 " positions stored (%.0f MB)       \n",

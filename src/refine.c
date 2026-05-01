@@ -8,6 +8,9 @@
 #include "align.h"
 #include "mdl.h"
 
+/* Runtime-configurable max DP cells (default 10M ~40MB) */
+int64_t g_refine_max_dp_cells = 10 * 1000 * 1000;
+
 /* ================================================================
  * K-mer profile for fast screening
  * ================================================================ */
@@ -82,7 +85,7 @@ static int semiglobal_align(const char *query, int qlen,
 {
     /* Guard against huge DP matrices */
     int64_t dp_cells = (int64_t)(qlen + 1) * (int64_t)(tlen + 1);
-    if (dp_cells > REFINE_MAX_DP_CELLS) {
+    if (dp_cells > g_refine_max_dp_cells) {
         if (identity_out) *identity_out = 0;
         if (coverage_out) *coverage_out = 0;
         if (aligned_out) *aligned_out = 0;
@@ -194,6 +197,77 @@ static int cmp_instance_pos(const void *x, const void *y)
 }
 
 /*
+ * Compute the fraction of SHORTER family's instances fully contained
+ * (≥80% of the shorter instance overlaps a longer instance) within
+ * LONGER family's instances.
+ *
+ * Used as the nested-element merge gate (P1 follow-up).  When two
+ * consensi pass 80-80-80 at 100% identity / 100% coverage and the
+ * shorter is fully embedded in the longer, the question is biological:
+ *   - If most of the shorter family's instances are nested in the
+ *     longer's → the shorter is just a fragment view of the longer →
+ *     merge.
+ *   - If many of the shorter's instances are SOLO (no overlapping
+ *     longer instance) → the shorter is a distinct family that
+ *     happens to be sequence-similar to a contained region of the
+ *     longer (e.g. SINE inside LINE; the SINE also exists solo) →
+ *     DO NOT merge.
+ *
+ * Returns: containment fraction in [0, 1].  Computed in O(n_short ×
+ * n_long) which is fine since merge candidates are already filtered.
+ */
+static float nested_containment_fraction(const CandidateFamily *shorter,
+                                         const CandidateFamily *longer)
+{
+    if (shorter->num_instances == 0) return 0.0f;
+    int contained = 0;
+    int solo      = 0;  /* shorter instances NOT overlapping any longer inst */
+    for (int i = 0; i < shorter->num_instances; i++) {
+        gpos_t s_start = shorter->instances[i].position;
+        gpos_t s_end   = s_start + shorter->instances[i].aligned_length;
+        glen_t s_len   = shorter->instances[i].aligned_length;
+        if (s_len <= 0) continue;
+        int matched = 0;
+        int any_overlap = 0;
+        for (int j = 0; j < longer->num_instances; j++) {
+            /* B+Q6 / ENG-N11: cross-chromosome guard.  Without this,
+             * positions on different sequences (which share the same
+             * gpos_t coordinate origin only by accident) are compared
+             * as if they lived on a single concatenated genome. */
+            if (shorter->instances[i].seq_index != longer->instances[j].seq_index)
+                continue;
+            gpos_t l_start = longer->instances[j].position;
+            gpos_t l_end   = l_start + longer->instances[j].aligned_length;
+            gpos_t ov_s = (s_start > l_start) ? s_start : l_start;
+            gpos_t ov_e = (s_end   < l_end)   ? s_end   : l_end;
+            if (ov_e <= ov_s) continue;
+            any_overlap = 1;
+            glen_t ov_len = ov_e - ov_s;
+            if ((float)ov_len / (float)s_len >= 0.80f) {
+                matched = 1;
+                break;
+            }
+        }
+        if (matched) contained++;
+        else if (!any_overlap) solo++;
+    }
+    /* B (Tier 1.5a): "solo evidence" tightening.  When the shorter family
+     * has FEWER than 2 instances outside any longer instance, the two
+     * families look indistinguishable in genomic occurrence — likely a
+     * structural prefix/suffix relationship (longer = X + shorter, with
+     * shorter never living on its own).  In that case, do NOT let the
+     * containment-fraction gate block the merge: report full containment
+     * so the caller's `ctf < 0.50f` veto does not fire.  We only veto
+     * (return low containment) when there is meaningful solo evidence
+     * (≥ 2 truly solo shorter instances) AND most shorter instances are
+     * not nested.  This catches the SINE-in-LINE case (SINE has many
+     * solo instances) while letting strict-prefix/suffix structural
+     * matches merge cleanly. */
+    if (solo < 2) return 1.0f;
+    return (float)contained / (float)shorter->num_instances;
+}
+
+/*
  * Check if instances of two families significantly overlap in the genome.
  * Returns 1 if overlap_frac >= REFINE_OVERLAP_RELAX, 0 otherwise.
  *
@@ -232,6 +306,10 @@ static int check_instance_overlap(const CandidateFamily *a,
 
             /* Scan forward from lo */
             for (int j = lo; j < b->num_instances; j++) {
+                /* ENG-N11 cross-chromosome guard: positions sorted purely
+                 * by gpos_t mix multiple sequences; skip any pair on
+                 * different chromosomes before computing overlap. */
+                if (a->instances[i].seq_index != b_sorted[j].seq_index) continue;
                 gpos_t b_start = b_sorted[j].position;
                 if (b_start >= a_end) break; /* no more can overlap */
                 gpos_t b_end2 = b_start + b_sorted[j].aligned_length;
@@ -259,6 +337,9 @@ fallback:
             gpos_t a_end   = a_start + a->instances[i].aligned_length;
 
             for (int j = 0; j < b->num_instances; j++) {
+                /* ENG-N11 cross-chromosome guard: skip pairs on
+                 * different sequences before computing overlap. */
+                if (a->instances[i].seq_index != b->instances[j].seq_index) continue;
                 gpos_t b_start = b->instances[j].position;
                 gpos_t b_end   = b_start + b->instances[j].aligned_length;
 
@@ -308,6 +389,71 @@ static void uf_unite(int *parent, int *rank, int a, int b)
 }
 
 /* ================================================================
+ * MDL gate for merge candidate pairs
+ * ================================================================ */
+
+/*
+ * Estimate the MDL score of merging two candidate families anchored on
+ * the longer family's consensus.  When two families with consensus
+ * identity I are merged, instances from each family are re-encoded
+ * against the merged (centroid) consensus; both halves of the merged
+ * family pay an estimated half_extra = (1-I)/2 additional divergence
+ * (since the centroid sits roughly equidistant between the two original
+ * consensi).
+ *
+ * Returns the estimated MDL score (savings - model_cost) of the merged
+ * family.  A value <= 0 indicates the merger would produce a family
+ * that fails MDL on its own, in which case the union-find merger should
+ * be vetoed: otherwise both originals are absorbed into a non-viable
+ * merged family that mdl_select_library will then reject, losing both.
+ *
+ * This is an approximation — the true post-merger consensus is computed
+ * by align_refine_family after the merge — but it is fast (no DP) and
+ * conservative enough to catch obvious union-find runaway chains.
+ */
+static double estimate_merge_score(const CandidateFamily *a,
+                                   const CandidateFamily *b,
+                                   float identity, int num_families)
+{
+    if (a->num_instances <= 0 && b->num_instances <= 0) return 0.0;
+
+    int big_len = (a->consensus_length >= b->consensus_length)
+                  ? a->consensus_length : b->consensus_length;
+    if (big_len <= 0) return 0.0;
+
+    double model_cost = mdl_model_cost(big_len);
+    double savings = 0.0;
+
+    /* Both halves pay roughly half of the consensus-pair distance (1-I)
+     * as additional divergence relative to the centroid consensus. */
+    double half_extra = ((double)(1.0f - identity)) / 2.0;
+    if (half_extra < 0.0) half_extra = 0.0;
+
+    const CandidateFamily *halves[2] = {a, b};
+    for (int h = 0; h < 2; h++) {
+        const CandidateFamily *fam = halves[h];
+        for (int i = 0; i < fam->num_instances; i++) {
+            const Instance *inst = &fam->instances[i];
+            int a_i = (int)inst->aligned_length;
+            if (a_i <= 0) continue;
+
+            double new_div = (double)inst->divergence + half_extra;
+            if (new_div < 0.0) new_div = 0.0;
+            if (new_div > 0.5) new_div = 0.5;
+            int m_i = (int)(new_div * (double)a_i + 0.5);
+            if (m_i < 0) m_i = 0;
+            if (m_i > a_i) m_i = a_i;
+
+            double lit = 2.0 * (double)a_i;
+            double enc = mdl_instance_cost_full(a_i, m_i, big_len, num_families);
+            savings += (lit - enc);
+        }
+    }
+
+    return savings - model_cost;
+}
+
+/* ================================================================
  * Parallel merge worker
  * ================================================================ */
 
@@ -319,6 +465,9 @@ typedef struct {
     int                  n;
     int                 *next_row;     /* shared atomic row counter */
     int                  max_cons_len;
+    int                  num_families;  /* R estimate for MDL gate */
+    int                  verbose;
+    int                  mdl_vetoes;    /* per-thread veto count */
     /* Per-thread output */
     MergePair           *pairs;
     int                  num_pairs;
@@ -358,14 +507,28 @@ static void *merge_worker_fn(void *arg)
             if (qlen < REFINE_MIN_ALIGNED)
                 continue;
 
-            int should_merge = 0;
+            /* Length-ratio guard (Stage B fix 2).
+             * 80-80-80 mutual coverage permits merging vastly-different-
+             * length families (e.g. 500 vs 700 bp).  The merged consensus
+             * splits the difference; both sides' instances get trimmed at
+             * the consensus boundary, costing ~2.36 Mb on chr4 (REFINE_
+             * TRACE_REPORT bottleneck #2).  Reject when shorter / longer
+             * < 0.7. */
+            if ((float)qlen / (float)tlen < 0.7f)
+                continue;
+
+            int   should_merge = 0;
+            float gate_identity = 0.0f;  /* best identity seen for MDL gate */
 
             /* Check if DP would exceed cell limit for long consensus pairs */
             int64_t dp_cells = (int64_t)(qlen + 1) * (int64_t)(tlen + 1);
-            if (dp_cells > REFINE_MAX_DP_CELLS) {
-                /* Fallback: Jaccard + instance overlap for long families */
-                if (jaccard >= 0.80f && check_instance_overlap(fi, fj))
+            if (dp_cells > g_refine_max_dp_cells) {
+                /* Fallback: Jaccard + instance overlap for long families.
+                 * Use jaccard as a rough identity proxy for the MDL gate. */
+                if (jaccard >= 0.80f && check_instance_overlap(fi, fj)) {
                     should_merge = 1;
+                    gate_identity = jaccard;  /* approx identity */
+                }
             } else {
                 float fwd_identity = 0, fwd_coverage = 0;
                 int fwd_aligned = 0;
@@ -395,14 +558,69 @@ static void *merge_worker_fn(void *arg)
 
                 if (fwd_pass || rc_pass) {
                     should_merge = 1;
+                    gate_identity = best_identity;
                 } else if (best_identity >= REFINE_RELAXED_IDENTITY &&
                            best_coverage >= REFINE_RELAXED_COVERAGE) {
-                    if (check_instance_overlap(fi, fj))
+                    if (check_instance_overlap(fi, fj)) {
                         should_merge = 1;
+                        gate_identity = best_identity;
+                    }
                 }
             }
 
             if (should_merge) {
+                /* Nested-element gate (P1 follow-up): if the shorter
+                 * family's consensus is fully contained in the longer's
+                 * (100%-coverage match) but many of the shorter's
+                 * INSTANCES are not nested inside longer's instances,
+                 * the two are biologically distinct families that
+                 * happen to be sequence-similar (e.g. SINE inside LINE
+                 * + SINE solo elsewhere).  Without this check, strict
+                 * 80-80-80 destroys the shorter family.
+                 *
+                 * Trigger only when the shorter is highly contained in
+                 * the longer (coverage near 100%) — that's the nested-
+                 * candidate signal.  Then require ≥80% of the shorter's
+                 * instances be spatially contained; otherwise refuse. */
+                const CandidateFamily *shorter_f =
+                    (fi->consensus_length <= fj->consensus_length) ? fi : fj;
+                const CandidateFamily *longer_f =
+                    (fi->consensus_length <= fj->consensus_length) ? fj : fi;
+                if (longer_f->consensus_length >=
+                        shorter_f->consensus_length * 3 &&
+                    shorter_f->num_instances >= 3) {
+                    float ctf = nested_containment_fraction(shorter_f, longer_f);
+                    if (ctf < 0.50f) {
+                        w->mdl_vetoes++;
+                        if (w->verbose >= 2)
+                            fprintf(stderr, "  Merge nested-veto: F%u + F%u "
+                                    "(shorter=%d, longer=%d, "
+                                    "containment=%.2f)\n",
+                                    fi->id, fj->id,
+                                    shorter_f->consensus_length,
+                                    longer_f->consensus_length,
+                                    ctf);
+                        continue;
+                    }
+                }
+
+                /* MDL gate (symmetric with split / fragment-assembly):
+                 * veto if the merged family wouldn't pass MDL on its own.
+                 * Without this gate, union-find can chain marginally-similar
+                 * pairs into a single super-family with negative MDL, which
+                 * mdl_select_library then rejects — losing all originals. */
+                if (gate_identity <= 0.0f) gate_identity = REFINE_RELAXED_IDENTITY;
+                double merged_mdl = estimate_merge_score(fi, fj, gate_identity,
+                                                         w->num_families);
+                if (merged_mdl <= 0.0) {
+                    w->mdl_vetoes++;
+                    if (w->verbose >= 2)
+                        fprintf(stderr, "  Merge MDL veto: F%u + F%u "
+                                "(identity=%.2f, merged_mdl=%.1f)\n",
+                                fi->id, fj->id, gate_identity, merged_mdl);
+                    continue;
+                }
+
                 if (w->num_pairs >= w->cap_pairs) {
                     int nc = w->cap_pairs == 0 ? 256 : w->cap_pairs * 2;
                     MergePair *tmp = realloc(w->pairs,
@@ -499,18 +717,32 @@ int refine_merge_families(CandidateList *cl, const Genome *genome,
 
                 if (qlen < REFINE_MIN_ALIGNED) continue;
 
+                /* Length-ratio guard (Stage B fix 2; see merge_worker_fn). */
+                if ((float)qlen / (float)tlen < 0.7f)
+                    continue;
+
                 /* Check if DP would exceed cell limit for long consensus pairs */
                 int64_t dp_cells = (int64_t)(qlen + 1) * (int64_t)(tlen + 1);
-                if (dp_cells > REFINE_MAX_DP_CELLS) {
+                if (dp_cells > g_refine_max_dp_cells) {
                     /* Fallback: Jaccard + instance overlap for long families */
                     if (jaccard >= 0.80f && check_instance_overlap(fi, fj)) {
-                        uf_unite(parent, uf_rank, i, j);
-                        n_merges++;
-                        if (verbose >= 2)
-                            fprintf(stderr, "  Merge (long-fallback): F%d (len=%d) +"
-                                    " F%d (len=%d) jaccard=%.2f\n",
-                                    fi->id, fi->consensus_length,
-                                    fj->id, fj->consensus_length, jaccard);
+                        /* MDL gate (see merge_worker_fn for rationale) */
+                        double mm = estimate_merge_score(fi, fj, jaccard, n);
+                        if (mm <= 0.0) {
+                            if (verbose >= 2)
+                                fprintf(stderr, "  Merge MDL veto (long): "
+                                        "F%d + F%d (jaccard=%.2f, "
+                                        "merged_mdl=%.1f)\n",
+                                        fi->id, fj->id, jaccard, mm);
+                        } else {
+                            uf_unite(parent, uf_rank, i, j);
+                            n_merges++;
+                            if (verbose >= 2)
+                                fprintf(stderr, "  Merge (long-fallback): F%d (len=%d) +"
+                                        " F%d (len=%d) jaccard=%.2f\n",
+                                        fi->id, fi->consensus_length,
+                                        fj->id, fj->consensus_length, jaccard);
+                        }
                     }
                     continue;
                 }
@@ -538,6 +770,37 @@ int refine_merge_families(CandidateList *cl, const Genome *genome,
                 }
 
                 if (fwd_pass || rc_pass) {
+                    /* Nested-element gate (P1 follow-up): see
+                     * merge_worker_fn for rationale. */
+                    const CandidateFamily *shorter_f =
+                        (fi->consensus_length <= fj->consensus_length) ? fi : fj;
+                    const CandidateFamily *longer_f =
+                        (fi->consensus_length <= fj->consensus_length) ? fj : fi;
+                    if (longer_f->consensus_length >=
+                            shorter_f->consensus_length * 3 &&
+                        shorter_f->num_instances >= 3) {
+                        float ctf = nested_containment_fraction(shorter_f, longer_f);
+                        if (ctf < 0.50f) {
+                            if (verbose >= 2)
+                                fprintf(stderr, "  Merge nested-veto: F%d + F%d "
+                                        "(shorter=%d, longer=%d, "
+                                        "containment=%.2f)\n",
+                                        fi->id, fj->id,
+                                        shorter_f->consensus_length,
+                                        longer_f->consensus_length, ctf);
+                            continue;
+                        }
+                    }
+
+                    /* MDL gate */
+                    double mm = estimate_merge_score(fi, fj, best_identity, n);
+                    if (mm <= 0.0) {
+                        if (verbose >= 2)
+                            fprintf(stderr, "  Merge MDL veto: F%d + F%d "
+                                    "(identity=%.2f, merged_mdl=%.1f)\n",
+                                    fi->id, fj->id, best_identity, mm);
+                        continue;
+                    }
                     uf_unite(parent, uf_rank, i, j);
                     n_merges++;
                     if (verbose >= 2)
@@ -554,14 +817,24 @@ int refine_merge_families(CandidateList *cl, const Genome *genome,
                 if (best_identity >= REFINE_RELAXED_IDENTITY &&
                     best_coverage >= REFINE_RELAXED_COVERAGE) {
                     if (check_instance_overlap(fi, fj)) {
-                        uf_unite(parent, uf_rank, i, j);
-                        n_merges++;
-                        if (verbose >= 2)
-                            fprintf(stderr, "  Merge (relaxed): F%d + F%d"
-                                    " identity=%.1f%% coverage=%.1f%%\n",
-                                    fi->id, fj->id,
-                                    best_identity * 100,
-                                    best_coverage * 100);
+                        /* MDL gate */
+                        double mm = estimate_merge_score(fi, fj, best_identity, n);
+                        if (mm <= 0.0) {
+                            if (verbose >= 2)
+                                fprintf(stderr, "  Merge MDL veto (relaxed): "
+                                        "F%d + F%d (identity=%.2f, "
+                                        "merged_mdl=%.1f)\n",
+                                        fi->id, fj->id, best_identity, mm);
+                        } else {
+                            uf_unite(parent, uf_rank, i, j);
+                            n_merges++;
+                            if (verbose >= 2)
+                                fprintf(stderr, "  Merge (relaxed): F%d + F%d"
+                                        " identity=%.1f%% coverage=%.1f%%\n",
+                                        fi->id, fj->id,
+                                        best_identity * 100,
+                                        best_coverage * 100);
+                        }
                     }
                 }
             }
@@ -587,6 +860,9 @@ int refine_merge_families(CandidateList *cl, const Genome *genome,
             workers[t].n = n;
             workers[t].next_row = &shared_next_row;
             workers[t].max_cons_len = max_cons_len;
+            workers[t].num_families = n;       /* R estimate for MDL gate */
+            workers[t].verbose = verbose;
+            workers[t].mdl_vetoes = 0;
         }
 
         int launched = 0;
@@ -602,6 +878,7 @@ int refine_merge_families(CandidateList *cl, const Genome *genome,
             pthread_join(threads[t], NULL);
 
         /* Apply collected merge pairs to union-find (sequential) */
+        int total_vetoes = 0;
         for (int t = 0; t < num_threads; t++) {
             for (int p = 0; p < workers[t].num_pairs; p++) {
                 int i = workers[t].pairs[p].i;
@@ -611,8 +888,12 @@ int refine_merge_families(CandidateList *cl, const Genome *genome,
                     n_merges++;
                 }
             }
+            total_vetoes += workers[t].mdl_vetoes;
             free(workers[t].pairs);
         }
+        if (verbose && total_vetoes > 0)
+            fprintf(stderr, "Merge MDL gate: vetoed %d of %d candidate pairs\n",
+                    total_vetoes, total_vetoes + n_merges);
         free(workers);
         free(threads);
     }
@@ -884,19 +1165,67 @@ static int build_subset_consensus(const CandidateFamily *fam,
     return cons_len;
 }
 
-int refine_split_families(CandidateList *cl, const Genome *genome,
-                          const KmerTable *kt, int k,
-                          glen_t genome_len, int verbose,
-                          int num_families)
+/* ----------------------------------------------------------------
+ * Parallel split: result struct for Phase 1 (analysis)
+ * ---------------------------------------------------------------- */
+
+typedef struct {
+    int       family_idx;    /* which family was split */
+    int       valid;         /* 1 if split accepted */
+    Instance *lo_insts;
+    int       n_lo;
+    char     *lo_cons;
+    int       lo_clen;
+    double    lo_mdl_score;
+    double    lo_model_cost;
+    Instance *hi_insts;
+    int       n_hi;
+    char     *hi_cons;
+    int       hi_clen;
+    double    hi_mdl_score;
+    double    hi_model_cost;
+    float     mean_lo;       /* for verbose output */
+    float     mean_hi;
+    double    orig_score;
+    double    split_score;
+} SplitResult;
+
+/* ----------------------------------------------------------------
+ * Phase 1 worker: parallel split analysis (read-only on cl)
+ * ---------------------------------------------------------------- */
+
+typedef struct {
+    const CandidateFamily *families; /* snapshot pointer (read-only) */
+    const Genome          *genome;
+    glen_t                 genome_len;
+    int                    num_families;
+    int                    verbose;
+    int                    orig_n;
+    int                   *next_idx;   /* shared atomic counter */
+    SplitResult           *results;    /* pre-allocated array [orig_n] */
+} SplitAnalysisArgs;
+
+static void *split_analysis_worker(void *arg)
 {
-    int n_splits = 0;
-    int orig_n = cl->num_families;
+    SplitAnalysisArgs *w = (SplitAnalysisArgs *)arg;
 
-    for (int fi = 0; fi < orig_n; fi++) {
-        CandidateFamily *fam = &cl->families[fi];
+    while (1) {
+        int fi = __atomic_fetch_add(w->next_idx, 1, __ATOMIC_RELAXED);
+        if (fi >= w->orig_n) break;
 
-        if (fam->num_instances < REFINE_MIN_SPLIT_INSTANCES)
+        SplitResult *res = &w->results[fi];
+        res->family_idx = fi;
+        res->valid = 0;
+
+        const CandidateFamily *fam = &w->families[fi];
+
+        if (fam->num_instances < REFINE_MIN_SPLIT_INSTANCES) {
+            if (w->verbose >= 2)
+                fprintf(stderr, "  [split] F%d: skipped: n_instances=%d < "
+                        "REFINE_MIN_SPLIT_INSTANCES=%d\n",
+                        fam->id, fam->num_instances, REFINE_MIN_SPLIT_INSTANCES);
             continue;
+        }
 
         /* Collect divergence values */
         float *divs = malloc((size_t)fam->num_instances * sizeof(float));
@@ -911,15 +1240,21 @@ int refine_split_families(CandidateList *cl, const Genome *genome,
                                          &valley_pass);
 
         if (bimodality < REFINE_BIMODALITY_THRESH) {
+            if (w->verbose >= 2)
+                fprintf(stderr, "  [split] F%d: rejected: bimodality=%.3f < "
+                        "threshold=%.3f (n=%d)\n",
+                        fam->id, bimodality, REFINE_BIMODALITY_THRESH,
+                        fam->num_instances);
             free(divs);
             continue;
         }
 
-        /* Valley depth check: reject borderline splits without clear valley */
+        /* Valley depth check */
         if (!valley_pass) {
-            if (verbose >= 2)
-                fprintf(stderr, "  Skip split F%d: bimodality=%.2f but "
-                        "valley not deep enough\n", fam->id, bimodality);
+            if (w->verbose >= 2)
+                fprintf(stderr, "  [split] F%d: rejected: valley not deep enough "
+                        "(bimodality=%.3f, n=%d)\n",
+                        fam->id, bimodality, fam->num_instances);
             free(divs);
             continue;
         }
@@ -933,6 +1268,11 @@ int refine_split_families(CandidateList *cl, const Genome *genome,
 
         if (n_lo < REFINE_MIN_CLUSTER_SIZE ||
             n_hi < REFINE_MIN_CLUSTER_SIZE) {
+            if (w->verbose >= 2)
+                fprintf(stderr, "  [split] F%d: rejected: n_lo=%d or n_hi=%d < "
+                        "REFINE_MIN_CLUSTER_SIZE=%d (threshold=%.3f, n=%d)\n",
+                        fam->id, n_lo, n_hi, REFINE_MIN_CLUSTER_SIZE,
+                        threshold, fam->num_instances);
             free(divs);
             continue;
         }
@@ -947,6 +1287,11 @@ int refine_split_families(CandidateList *cl, const Genome *genome,
         mean_hi /= n_hi;
 
         if (mean_hi - mean_lo < REFINE_MIN_DIV_GAP) {
+            if (w->verbose >= 2)
+                fprintf(stderr, "  [split] F%d: rejected: div_gap=%.3f < "
+                        "REFINE_MIN_DIV_GAP=%.3f (mean_lo=%.3f mean_hi=%.3f, n=%d)\n",
+                        fam->id, mean_hi - mean_lo, REFINE_MIN_DIV_GAP,
+                        mean_lo, mean_hi, fam->num_instances);
             free(divs);
             continue;
         }
@@ -970,9 +1315,9 @@ int refine_split_families(CandidateList *cl, const Genome *genome,
 
         /* Build consensus for each group */
         char *lo_cons = NULL, *hi_cons = NULL;
-        int lo_clen = build_subset_consensus(fam, lo_insts, n_lo, genome,
+        int lo_clen = build_subset_consensus(fam, lo_insts, n_lo, w->genome,
                                              &lo_cons);
-        int hi_clen = build_subset_consensus(fam, hi_insts, n_hi, genome,
+        int hi_clen = build_subset_consensus(fam, hi_insts, n_hi, w->genome,
                                              &hi_cons);
 
         if (lo_clen <= 0 || hi_clen <= 0) {
@@ -981,9 +1326,11 @@ int refine_split_families(CandidateList *cl, const Genome *genome,
             continue;
         }
 
-        /* Score original family */
-        mdl_score_family(fam, genome_len, num_families);
-        double orig_score = fam->mdl_score;
+        /* Score original family (into a local copy to avoid racing) */
+        CandidateFamily orig_copy;
+        memcpy(&orig_copy, fam, sizeof(CandidateFamily));
+        mdl_score_family(&orig_copy, w->genome_len, w->num_families);
+        double orig_score = orig_copy.mdl_score;
 
         /* Create temporary sub-families and score them */
         CandidateFamily sub_lo, sub_hi;
@@ -1002,71 +1349,478 @@ int refine_split_families(CandidateList *cl, const Genome *genome,
         sub_hi.num_instances = n_hi;
         sub_hi.cap_instances = n_hi;
 
-        /* Use num_families+1 for scoring splits (one more family after split) */
-        mdl_score_family(&sub_lo, genome_len, num_families + 1);
-        mdl_score_family(&sub_hi, genome_len, num_families + 1);
+        mdl_score_family(&sub_lo, w->genome_len, w->num_families + 1);
+        mdl_score_family(&sub_hi, w->genome_len, w->num_families + 1);
         double split_score = sub_lo.mdl_score + sub_hi.mdl_score;
 
         if (split_score <= orig_score) {
-            /* Split doesn't improve MDL, reject */
+            if (w->verbose >= 2)
+                fprintf(stderr, "  [split] F%d: rejected: split MDL gain <= 0 "
+                        "(orig=%.1f, split=%.1f=%.1f+%.1f, n=%d)\n",
+                        fam->id, orig_score, split_score,
+                        sub_lo.mdl_score, sub_hi.mdl_score,
+                        fam->num_instances);
             free(lo_cons); free(hi_cons);
             free(lo_insts); free(hi_insts);
             continue;
         }
 
-        /* Accept split: replace original with sub_lo, add sub_hi as new */
+        if (w->verbose >= 2)
+            fprintf(stderr, "  [split] F%d: accepted: split into n_lo=%d / n_hi=%d "
+                    "at threshold=%.3f (div %.1f%% / %.1f%%), MDL %.1f -> %.1f\n",
+                    fam->id, n_lo, n_hi, threshold,
+                    mean_lo * 100, mean_hi * 100,
+                    orig_score, split_score);
+
+        /* Store accepted result */
+        res->valid = 1;
+        res->lo_insts = lo_insts;
+        res->n_lo = n_lo;
+        res->lo_cons = lo_cons;
+        res->lo_clen = lo_clen;
+        res->lo_mdl_score = sub_lo.mdl_score;
+        res->lo_model_cost = sub_lo.model_cost;
+        res->hi_insts = hi_insts;
+        res->n_hi = n_hi;
+        res->hi_cons = hi_cons;
+        res->hi_clen = hi_clen;
+        res->hi_mdl_score = sub_hi.mdl_score;
+        res->hi_model_cost = sub_hi.model_cost;
+        res->mean_lo = mean_lo;
+        res->mean_hi = mean_hi;
+        res->orig_score = orig_score;
+        res->split_score = split_score;
+    }
+
+    return NULL;
+}
+
+/* ----------------------------------------------------------------
+ * Phase 2 worker: parallel align_refine on split families
+ * ---------------------------------------------------------------- */
+
+typedef struct {
+    CandidateList     *cl;
+    const Genome      *genome;
+    const KmerTable   *kt;
+    int                k;
+    int               *refine_indices;  /* family indices to refine */
+    int                n_refine;
+    int               *next_refine;     /* shared atomic counter */
+} RefineWorkerArgs;
+
+static void *refine_split_worker(void *arg)
+{
+    RefineWorkerArgs *w = (RefineWorkerArgs *)arg;
+
+    while (1) {
+        int ri = __atomic_fetch_add(w->next_refine, 1, __ATOMIC_RELAXED);
+        if (ri >= w->n_refine) break;
+
+        int fi = w->refine_indices[ri];
+        align_refine_family(&w->cl->families[fi], w->genome, w->kt, w->k,
+                            ALIGN_MAX_ITERATIONS);
+    }
+
+    return NULL;
+}
+
+/* ================================================================
+ * refine_split_families — two-phase parallel implementation
+ * ================================================================ */
+
+int refine_split_families(CandidateList *cl, const Genome *genome,
+                          const KmerTable *kt, int k,
+                          glen_t genome_len, int verbose,
+                          int num_families, int num_threads)
+{
+    int orig_n = cl->num_families;
+
+    /* --- Sequential fallback (num_threads <= 1) --- */
+    if (num_threads <= 1) {
+        int n_splits = 0;
+
+        for (int fi = 0; fi < orig_n; fi++) {
+            CandidateFamily *fam = &cl->families[fi];
+
+            if (fam->num_instances < REFINE_MIN_SPLIT_INSTANCES) {
+                if (verbose >= 2)
+                    fprintf(stderr, "  [split] F%d: skipped: n_instances=%d < "
+                            "REFINE_MIN_SPLIT_INSTANCES=%d\n",
+                            fam->id, fam->num_instances, REFINE_MIN_SPLIT_INSTANCES);
+                continue;
+            }
+
+            /* Collect divergence values */
+            float *divs = malloc((size_t)fam->num_instances * sizeof(float));
+            if (!divs) continue;
+            for (int j = 0; j < fam->num_instances; j++)
+                divs[j] = fam->instances[j].divergence;
+
+            /* Otsu's method to find split threshold */
+            float bimodality;
+            int valley_pass;
+            float threshold = otsu_threshold(divs, fam->num_instances,
+                                             &bimodality, &valley_pass);
+
+            if (bimodality < REFINE_BIMODALITY_THRESH) {
+                if (verbose >= 2)
+                    fprintf(stderr, "  [split] F%d: rejected: bimodality=%.3f < "
+                            "threshold=%.3f (n=%d)\n",
+                            fam->id, bimodality, REFINE_BIMODALITY_THRESH,
+                            fam->num_instances);
+                free(divs);
+                continue;
+            }
+
+            /* Valley depth check */
+            if (!valley_pass) {
+                if (verbose >= 2)
+                    fprintf(stderr, "  [split] F%d: rejected: valley not deep enough "
+                            "(bimodality=%.3f, n=%d)\n",
+                            fam->id, bimodality, fam->num_instances);
+                free(divs);
+                continue;
+            }
+
+            /* Split instances into two groups */
+            int n_lo = 0, n_hi = 0;
+            for (int j = 0; j < fam->num_instances; j++) {
+                if (divs[j] <= threshold) n_lo++;
+                else n_hi++;
+            }
+
+            if (n_lo < REFINE_MIN_CLUSTER_SIZE ||
+                n_hi < REFINE_MIN_CLUSTER_SIZE) {
+                if (verbose >= 2)
+                    fprintf(stderr, "  [split] F%d: rejected: n_lo=%d or n_hi=%d < "
+                            "REFINE_MIN_CLUSTER_SIZE=%d (threshold=%.3f, n=%d)\n",
+                            fam->id, n_lo, n_hi, REFINE_MIN_CLUSTER_SIZE,
+                            threshold, fam->num_instances);
+                free(divs);
+                continue;
+            }
+
+            /* Check mean divergence gap */
+            float mean_lo = 0, mean_hi = 0;
+            for (int j = 0; j < fam->num_instances; j++) {
+                if (divs[j] <= threshold) mean_lo += divs[j];
+                else mean_hi += divs[j];
+            }
+            mean_lo /= n_lo;
+            mean_hi /= n_hi;
+
+            if (mean_hi - mean_lo < REFINE_MIN_DIV_GAP) {
+                if (verbose >= 2)
+                    fprintf(stderr, "  [split] F%d: rejected: div_gap=%.3f < "
+                            "REFINE_MIN_DIV_GAP=%.3f (mean_lo=%.3f mean_hi=%.3f, n=%d)\n",
+                            fam->id, mean_hi - mean_lo, REFINE_MIN_DIV_GAP,
+                            mean_lo, mean_hi, fam->num_instances);
+                free(divs);
+                continue;
+            }
+
+            /* Allocate instance arrays for each group */
+            Instance *lo_insts = malloc((size_t)n_lo * sizeof(Instance));
+            Instance *hi_insts = malloc((size_t)n_hi * sizeof(Instance));
+            if (!lo_insts || !hi_insts) {
+                free(lo_insts); free(hi_insts); free(divs);
+                continue;
+            }
+
+            int li = 0, hi = 0;
+            for (int j = 0; j < fam->num_instances; j++) {
+                if (divs[j] <= threshold)
+                    lo_insts[li++] = fam->instances[j];
+                else
+                    hi_insts[hi++] = fam->instances[j];
+            }
+            free(divs);
+
+            /* Build consensus for each group */
+            char *lo_cons = NULL, *hi_cons = NULL;
+            int lo_clen = build_subset_consensus(fam, lo_insts, n_lo, genome,
+                                                 &lo_cons);
+            int hi_clen = build_subset_consensus(fam, hi_insts, n_hi, genome,
+                                                 &hi_cons);
+
+            if (lo_clen <= 0 || hi_clen <= 0) {
+                free(lo_insts); free(hi_insts);
+                free(lo_cons); free(hi_cons);
+                continue;
+            }
+
+            /* Score original family */
+            mdl_score_family(fam, genome_len, num_families);
+            double orig_score = fam->mdl_score;
+
+            /* Create temporary sub-families and score them */
+            CandidateFamily sub_lo, sub_hi;
+            memset(&sub_lo, 0, sizeof(sub_lo));
+            memset(&sub_hi, 0, sizeof(sub_hi));
+
+            sub_lo.consensus = lo_cons;
+            sub_lo.consensus_length = lo_clen;
+            sub_lo.instances = lo_insts;
+            sub_lo.num_instances = n_lo;
+            sub_lo.cap_instances = n_lo;
+
+            sub_hi.consensus = hi_cons;
+            sub_hi.consensus_length = hi_clen;
+            sub_hi.instances = hi_insts;
+            sub_hi.num_instances = n_hi;
+            sub_hi.cap_instances = n_hi;
+
+            mdl_score_family(&sub_lo, genome_len, num_families + 1);
+            mdl_score_family(&sub_hi, genome_len, num_families + 1);
+            double split_score = sub_lo.mdl_score + sub_hi.mdl_score;
+
+            if (split_score <= orig_score) {
+                if (verbose >= 2)
+                    fprintf(stderr, "  [split] F%d: rejected: split MDL gain <= 0 "
+                            "(orig=%.1f, split=%.1f=%.1f+%.1f, n=%d)\n",
+                            fam->id, orig_score, split_score,
+                            sub_lo.mdl_score, sub_hi.mdl_score,
+                            fam->num_instances);
+                free(lo_cons); free(hi_cons);
+                free(lo_insts); free(hi_insts);
+                continue;
+            }
+
+            /* Accept split */
+            if (verbose >= 2)
+                fprintf(stderr, "  [split] F%d: accepted: split into n_lo=%d / n_hi=%d "
+                        "at threshold=%.3f (div %.1f%% / %.1f%%), MDL %.1f -> %.1f\n",
+                        fam->id, n_lo, n_hi, threshold,
+                        mean_lo * 100, mean_hi * 100,
+                        orig_score, split_score);
+            else if (verbose)
+                fprintf(stderr, "  Split F%d: %d instances (div %.1f%%) + "
+                        "%d instances (div %.1f%%), MDL %.1f -> %.1f\n",
+                        fam->id, n_lo, mean_lo * 100, n_hi, mean_hi * 100,
+                        orig_score, split_score);
+
+            /* Replace original family with low-divergence group */
+            free(fam->consensus);
+            free(fam->instances);
+            fam->consensus = lo_cons;
+            fam->consensus_length = lo_clen;
+            fam->instances = lo_insts;
+            fam->num_instances = n_lo;
+            fam->cap_instances = n_lo;
+            fam->mdl_score = sub_lo.mdl_score;
+            fam->model_cost = sub_lo.model_cost;
+
+            /* Add high-divergence group as new family */
+            if (cl->num_families >= cl->cap_families) {
+                int new_cap = cl->cap_families * 2;
+                CandidateFamily *tmp = realloc(cl->families,
+                                               (size_t)new_cap * sizeof(CandidateFamily));
+                if (!tmp) { free(hi_cons); free(hi_insts); continue; }
+                cl->families = tmp;
+                cl->cap_families = new_cap;
+                fam = &cl->families[fi];
+            }
+
+            CandidateFamily *new_fam = &cl->families[cl->num_families];
+            memset(new_fam, 0, sizeof(CandidateFamily));
+            new_fam->id = (uid_t)cl->num_families;
+            new_fam->consensus = hi_cons;
+            new_fam->consensus_length = hi_clen;
+            new_fam->instances = hi_insts;
+            new_fam->num_instances = n_hi;
+            new_fam->cap_instances = n_hi;
+            new_fam->component_id = fam->component_id;
+            new_fam->topology = fam->topology;
+            new_fam->estimated_copies = (freq_t)n_hi;
+            new_fam->mdl_score = sub_hi.mdl_score;
+            new_fam->model_cost = sub_hi.model_cost;
+            cl->num_families++;
+
+            /* Re-refine both split families */
+            align_refine_family(&cl->families[fi], genome, kt, k,
+                                ALIGN_MAX_ITERATIONS);
+            align_refine_family(&cl->families[cl->num_families - 1], genome,
+                                kt, k, ALIGN_MAX_ITERATIONS);
+
+            n_splits++;
+        }
+
+        return n_splits;
+    }
+
+    /* ================================================================
+     * Parallel path (num_threads > 1): two-phase approach
+     * ================================================================ */
+
+    /* --- Phase 1: parallel split analysis (read-only on cl) --- */
+
+    SplitResult *results = calloc((size_t)orig_n, sizeof(SplitResult));
+    if (!results) return 0;
+
+    int next_idx = 0;
+    int n_workers = num_threads < orig_n ? num_threads : orig_n;
+    if (n_workers < 1) n_workers = 1;
+
+    SplitAnalysisArgs sa_args;
+    sa_args.families     = cl->families;
+    sa_args.genome       = genome;
+    sa_args.genome_len   = genome_len;
+    sa_args.num_families = num_families;
+    sa_args.verbose      = verbose;
+    sa_args.orig_n       = orig_n;
+    sa_args.next_idx     = &next_idx;
+    sa_args.results      = results;
+
+    if (n_workers > 1) {
+        pthread_t *threads = malloc((size_t)(n_workers - 1) * sizeof(pthread_t));
+        if (!threads) { free(results); return 0; }
+
+        for (int t = 0; t < n_workers - 1; t++)
+            pthread_create(&threads[t], NULL, split_analysis_worker, &sa_args);
+
+        /* Main thread also participates */
+        split_analysis_worker(&sa_args);
+
+        for (int t = 0; t < n_workers - 1; t++)
+            pthread_join(threads[t], NULL);
+
+        free(threads);
+    } else {
+        split_analysis_worker(&sa_args);
+    }
+
+    /* --- Phase 2a: sequential apply of accepted splits --- */
+
+    int n_splits = 0;
+
+    /* Collect indices of families to refine (both halves of each split) */
+    int refine_cap = orig_n;
+    int *refine_indices = malloc((size_t)refine_cap * sizeof(int));
+    if (!refine_indices) { free(results); return 0; }
+    int n_refine = 0;
+
+    for (int fi = 0; fi < orig_n; fi++) {
+        SplitResult *res = &results[fi];
+        if (!res->valid) continue;
+
+        CandidateFamily *fam = &cl->families[fi];
+
         if (verbose)
             fprintf(stderr, "  Split F%d: %d instances (div %.1f%%) + "
                     "%d instances (div %.1f%%), MDL %.1f -> %.1f\n",
-                    fam->id, n_lo, mean_lo * 100, n_hi, mean_hi * 100,
-                    orig_score, split_score);
+                    fam->id, res->n_lo, res->mean_lo * 100,
+                    res->n_hi, res->mean_hi * 100,
+                    res->orig_score, res->split_score);
 
         /* Replace original family with low-divergence group */
         free(fam->consensus);
         free(fam->instances);
-        fam->consensus = lo_cons;
-        fam->consensus_length = lo_clen;
-        fam->instances = lo_insts;
-        fam->num_instances = n_lo;
-        fam->cap_instances = n_lo;
-        fam->mdl_score = sub_lo.mdl_score;
-        fam->model_cost = sub_lo.model_cost;
+        fam->consensus = res->lo_cons;
+        fam->consensus_length = res->lo_clen;
+        fam->instances = res->lo_insts;
+        fam->num_instances = res->n_lo;
+        fam->cap_instances = res->n_lo;
+        fam->mdl_score = res->lo_mdl_score;
+        fam->model_cost = res->lo_model_cost;
 
         /* Add high-divergence group as new family */
         if (cl->num_families >= cl->cap_families) {
             int new_cap = cl->cap_families * 2;
             CandidateFamily *tmp = realloc(cl->families,
                                            (size_t)new_cap * sizeof(CandidateFamily));
-            if (!tmp) { free(hi_cons); free(hi_insts); continue; }
+            if (!tmp) {
+                /* Cannot append; free hi resources */
+                free(res->hi_cons);
+                free(res->hi_insts);
+                /* lo already applied, still counts as partial split */
+                n_splits++;
+                /* Still refine the lo half */
+                if (n_refine >= refine_cap) {
+                    refine_cap *= 2;
+                    refine_indices = realloc(refine_indices,
+                                             (size_t)refine_cap * sizeof(int));
+                }
+                if (refine_indices) refine_indices[n_refine++] = fi;
+                continue;
+            }
             cl->families = tmp;
             cl->cap_families = new_cap;
-            /* Re-acquire pointer after realloc */
-            fam = &cl->families[fi];
+            fam = &cl->families[fi]; /* re-acquire after realloc */
         }
 
-        CandidateFamily *new_fam = &cl->families[cl->num_families];
+        int new_idx = cl->num_families;
+        CandidateFamily *new_fam = &cl->families[new_idx];
         memset(new_fam, 0, sizeof(CandidateFamily));
-        new_fam->id = (uid_t)cl->num_families;
-        new_fam->consensus = hi_cons;
-        new_fam->consensus_length = hi_clen;
-        new_fam->instances = hi_insts;
-        new_fam->num_instances = n_hi;
-        new_fam->cap_instances = n_hi;
+        new_fam->id = (uid_t)new_idx;
+        new_fam->consensus = res->hi_cons;
+        new_fam->consensus_length = res->hi_clen;
+        new_fam->instances = res->hi_insts;
+        new_fam->num_instances = res->n_hi;
+        new_fam->cap_instances = res->n_hi;
         new_fam->component_id = fam->component_id;
         new_fam->topology = fam->topology;
-        new_fam->estimated_copies = (freq_t)n_hi;
-        new_fam->mdl_score = sub_hi.mdl_score;
-        new_fam->model_cost = sub_hi.model_cost;
+        new_fam->estimated_copies = (freq_t)res->n_hi;
+        new_fam->mdl_score = res->hi_mdl_score;
+        new_fam->model_cost = res->hi_model_cost;
         cl->num_families++;
 
-        /* Re-refine both split families */
-        align_refine_family(&cl->families[fi], genome, kt, k,
-                            ALIGN_MAX_ITERATIONS);
-        align_refine_family(&cl->families[cl->num_families - 1], genome, kt, k,
-                            ALIGN_MAX_ITERATIONS);
+        /* Grow refine_indices if needed */
+        if (n_refine + 2 > refine_cap) {
+            refine_cap = refine_cap * 2 + 2;
+            int *tmp2 = realloc(refine_indices,
+                                (size_t)refine_cap * sizeof(int));
+            if (!tmp2) { free(refine_indices); refine_indices = NULL; break; }
+            refine_indices = tmp2;
+        }
 
+        refine_indices[n_refine++] = fi;       /* lo half */
+        refine_indices[n_refine++] = new_idx;  /* hi half */
         n_splits++;
     }
+
+    free(results);
+
+    /* --- Phase 2b: parallel align_refine on all split families --- */
+
+    if (n_refine > 0 && refine_indices) {
+        int next_refine = 0;
+        int rw = num_threads < n_refine ? num_threads : n_refine;
+        if (rw < 1) rw = 1;
+
+        RefineWorkerArgs rw_args;
+        rw_args.cl             = cl;
+        rw_args.genome         = genome;
+        rw_args.kt             = kt;
+        rw_args.k              = k;
+        rw_args.refine_indices = refine_indices;
+        rw_args.n_refine       = n_refine;
+        rw_args.next_refine    = &next_refine;
+
+        if (rw > 1) {
+            pthread_t *threads = malloc((size_t)(rw - 1) * sizeof(pthread_t));
+            if (threads) {
+                for (int t = 0; t < rw - 1; t++)
+                    pthread_create(&threads[t], NULL, refine_split_worker,
+                                   &rw_args);
+
+                /* Main thread participates */
+                refine_split_worker(&rw_args);
+
+                for (int t = 0; t < rw - 1; t++)
+                    pthread_join(threads[t], NULL);
+
+                free(threads);
+            } else {
+                /* Fallback: sequential refine */
+                refine_split_worker(&rw_args);
+            }
+        } else {
+            refine_split_worker(&rw_args);
+        }
+    }
+
+    free(refine_indices);
 
     return n_splits;
 }
@@ -1075,8 +1829,127 @@ int refine_split_families(CandidateList *cl, const Genome *genome,
  * Phase 6.4: Pruning marginal families after MDL selection
  * ================================================================ */
 
-int refine_prune_families(CandidateList *cl, glen_t genome_len, int verbose,
-                          int num_families)
+/* (start, end, family_idx) interval entry used by the prune sweep-line.
+ * end is EXCLUSIVE (start + aligned_length).  family_idx points back
+ * into cl->families so the sweep can skip self-coverage and treat
+ * dynamically pruned families as no longer covering. */
+typedef struct {
+    gpos_t start;
+    gpos_t end;
+    int    fam_idx;
+} PruneInterval;
+
+static int cmp_prune_interval(const void *x, const void *y)
+{
+    gpos_t sa = ((const PruneInterval *)x)->start;
+    gpos_t sb = ((const PruneInterval *)y)->start;
+    if (sa < sb) return -1;
+    if (sa > sb) return  1;
+    return 0;
+}
+
+static int cmp_idxscore_score_asc(const void *x, const void *y);
+typedef struct { int idx; double score; } PruneIdxScore;
+static int cmp_idxscore_score_asc(const void *x, const void *y)
+{
+    /* Sort weakest (lowest score) first.  Stable secondary key on idx
+     * keeps the order deterministic across equal-score families. */
+    double sa = ((const PruneIdxScore *)x)->score;
+    double sb = ((const PruneIdxScore *)y)->score;
+    if (sa < sb) return -1;
+    if (sa > sb) return  1;
+    int ia = ((const PruneIdxScore *)x)->idx;
+    int ib = ((const PruneIdxScore *)y)->idx;
+    return (ia > ib) - (ia < ib);
+}
+
+/* Lower-bound search: returns smallest index i such that
+ * intervals[i].start >= key, or n if no such i exists. */
+static int prune_lower_bound_start(const PruneInterval *iv, int n, gpos_t key)
+{
+    int lo = 0, hi = n;
+    while (lo < hi) {
+        int mid = lo + ((hi - lo) >> 1);
+        if (iv[mid].start < key) lo = mid + 1;
+        else                     hi = mid;
+    }
+    return lo;
+}
+
+/*
+ * Count bases of [q_start, q_end) covered by ANY interval whose
+ * fam_idx is NOT excl_fam AND whose family has not been pruned
+ * (pruned[fam_idx] == 0).  Implemented as a bounded sweep over
+ * sorted intervals: scan from the first interval whose start could
+ * still overlap q_start (binary searched via max_end_before lookup
+ * is approximated by walking back a fixed window — simpler approach:
+ * scan from first start > q_start - max_len, where max_len is the
+ * largest interval end-start seen).  We instead binary-search to
+ * the first interval with start >= q_start, then walk backwards
+ * while previous starts are still within max_len of q_start.
+ *
+ * Returns the cardinality of the union of (other-family) overlap
+ * with [q_start, q_end), in bp.
+ */
+static int64_t prune_count_other_coverage(const PruneInterval *iv, int n,
+                                          gpos_t q_start, gpos_t q_end,
+                                          int excl_fam,
+                                          const uint8_t *pruned,
+                                          gpos_t max_interval_len)
+{
+    if (q_end <= q_start || n == 0) return 0;
+
+    /* Find first index whose start could overlap [q_start, q_end).
+     * An interval [s,e) overlaps [q_start, q_end) iff s < q_end and
+     * e > q_start.  Earliest possible overlapping index has
+     * s >= q_start - max_interval_len (since e > q_start ⇒ s > q_start - len).
+     * Binary-search for the first such start. */
+    gpos_t scan_from = q_start - max_interval_len;
+    int i = prune_lower_bound_start(iv, n, scan_from);
+
+    /* Walk forward, sweep-merging overlapping intervals clipped to
+     * [q_start, q_end).  Track current merged interval [cur_s, cur_e)
+     * and accumulate union length. */
+    int64_t covered = 0;
+    gpos_t cur_s = -1, cur_e = -1; /* -1 sentinel = no current run */
+
+    for (; i < n; i++) {
+        if (iv[i].start >= q_end) break;          /* sorted, all later miss */
+        if (iv[i].fam_idx == excl_fam) continue;  /* skip self */
+        if (pruned[iv[i].fam_idx]) continue;      /* skip pruned families */
+        gpos_t s = iv[i].start;
+        gpos_t e = iv[i].end;
+        if (e <= q_start) continue;               /* entirely before query */
+        if (s < q_start) s = q_start;
+        if (e > q_end)   e = q_end;
+        if (e <= s)      continue;
+
+        if (cur_s < 0) {
+            cur_s = s; cur_e = e;
+        } else if (s <= cur_e) {
+            if (e > cur_e) cur_e = e;             /* extend */
+        } else {
+            covered += (int64_t)(cur_e - cur_s);
+            cur_s = s; cur_e = e;
+        }
+    }
+    if (cur_s >= 0) covered += (int64_t)(cur_e - cur_s);
+    return covered;
+}
+
+/*
+ * Public entry point for the sweep-line core.  Exposed (file-local)
+ * for the sweep-line unit test.  Operates on a CandidateList;
+ * computes per-family "exclusive bp per instance" using sorted
+ * intervals + binary search rather than an O(genome_len) bitmap.
+ *
+ * The function returns the number of pruned families (and zeros
+ * their mdl_score in place).  Memory footprint is O(num_intervals),
+ * NOT O(genome_len) — so it scales to multi-Gbp genomes such as
+ * wheat (17 Gb) without a single fatal allocation.
+ */
+int refine_prune_families_sweepline(CandidateList *cl, glen_t genome_len,
+                                    int verbose, int num_families)
 {
     /* Count accepted families */
     int n_accepted = 0;
@@ -1085,9 +1958,11 @@ int refine_prune_families(CandidateList *cl, glen_t genome_len, int verbose,
 
     if (n_accepted <= 1) return 0;
 
-    /* Build (index, score) pairs for accepted families, sorted ascending */
-    typedef struct { int idx; double score; } IdxScore;
-    IdxScore *order = malloc((size_t)n_accepted * sizeof(IdxScore));
+    /* Build (idx, score) pairs for accepted families and sort weakest first.
+     * ENG-N10: replaces the previous O(n^2) selection sort with qsort
+     * (O(n log n)) — same numerical result, vastly cheaper at n_accepted
+     * in the tens of thousands. */
+    PruneIdxScore *order = malloc((size_t)n_accepted * sizeof(PruneIdxScore));
     if (!order) return 0;
 
     int oi = 0;
@@ -1098,61 +1973,90 @@ int refine_prune_families(CandidateList *cl, glen_t genome_len, int verbose,
             oi++;
         }
     }
+    qsort(order, (size_t)n_accepted, sizeof(PruneIdxScore),
+          cmp_idxscore_score_asc);
 
-    /* Sort by score ascending (weakest first) */
-    for (int i = 0; i < n_accepted - 1; i++) {
-        for (int j = i + 1; j < n_accepted; j++) {
-            if (order[j].score < order[i].score) {
-                IdxScore tmp = order[i];
-                order[i] = order[j];
-                order[j] = tmp;
-            }
-        }
+    /* ENG-N2: replace `uint8_t cov[genome_len]` (1 byte / base; 17 GB on
+     * wheat) with a sorted array of intervals.  Memory is O(num_intervals)
+     * which is bounded by total accepted-family instances, NOT genome
+     * size.  The "exclusive coverage" query (how many bases of an
+     * instance are covered ONLY by the candidate family) is implemented
+     * by counting OTHER-family coverage of the instance via a binary-
+     * searched local sweep, then subtracting from instance length.
+     *
+     * Pruning a family does NOT physically remove its intervals; we
+     * just flip pruned[fam_idx] = 1 and the sweep skips its contribution
+     * for subsequent candidates. */
+    int64_t total_intervals = 0;
+    for (int i = 0; i < cl->num_families; i++) {
+        if (cl->families[i].mdl_score <= 0) continue;
+        total_intervals += cl->families[i].num_instances;
     }
 
-    /* Build coverage count array */
-    uint8_t *cov = calloc((size_t)genome_len, 1);
-    if (!cov) { free(order); return 0; }
+    if (total_intervals == 0) { free(order); return 0; }
 
+    PruneInterval *intervals =
+        malloc((size_t)total_intervals * sizeof(PruneInterval));
+    if (!intervals) { free(order); return 0; }
+
+    /* pruned flag is per-family-in-the-CandidateList, indexed by idx
+     * (NOT by position in order[]).  Allocated per-family, not per-base,
+     * so it's O(cl->num_families) bytes — negligible. */
+    uint8_t *pruned = calloc((size_t)cl->num_families, 1);
+    if (!pruned) { free(intervals); free(order); return 0; }
+
+    int64_t ii = 0;
+    gpos_t  max_len = 0;
     for (int i = 0; i < cl->num_families; i++) {
         if (cl->families[i].mdl_score <= 0) continue;
         CandidateFamily *f = &cl->families[i];
         for (int j = 0; j < f->num_instances; j++) {
-            gpos_t start = f->instances[j].position;
-            int alen = (int)f->instances[j].aligned_length;
-            for (int p = 0; p < alen; p++) {
-                gpos_t gp = start + p;
-                if (gp >= 0 && gp < genome_len && cov[gp] < 255)
-                    cov[gp]++;
-            }
+            gpos_t s = f->instances[j].position;
+            gpos_t e = s + (gpos_t)f->instances[j].aligned_length;
+            /* Clip to genome bounds (matches original behavior, which
+             * silently ignored out-of-range positions). */
+            if (s < 0) s = 0;
+            if (e > genome_len) e = genome_len;
+            if (e <= s) continue;
+            intervals[ii].start   = s;
+            intervals[ii].end     = e;
+            intervals[ii].fam_idx = i;
+            if (e - s > max_len) max_len = e - s;
+            ii++;
         }
     }
+    int64_t n_intervals = ii;
+    qsort(intervals, (size_t)n_intervals, sizeof(PruneInterval),
+          cmp_prune_interval);
 
     int n_pruned = 0;
 
-    /* Try pruning each accepted family, weakest first */
     for (int k = 0; k < n_accepted; k++) {
         int fi = order[k].idx;
         CandidateFamily *f = &cl->families[fi];
-        if (f->mdl_score <= 0) continue; /* already pruned in this pass */
+        if (f->mdl_score <= 0) continue; /* defensive */
+        if (pruned[fi]) continue;        /* defensive */
 
-        /* Compute exclusive savings: only count positions where cov == 1 */
         double exclusive_savings = 0;
         int exclusive_instances = 0;
 
         for (int j = 0; j < f->num_instances; j++) {
             Instance *inst = &f->instances[j];
-            gpos_t start = inst->position;
+            gpos_t s = inst->position;
+            gpos_t e = s + (gpos_t)inst->aligned_length;
+            if (s < 0) s = 0;
+            if (e > genome_len) e = genome_len;
             int alen = (int)inst->aligned_length;
+            if (e <= s || alen <= 0) continue;
 
-            int excl_bases = 0;
-            for (int p = 0; p < alen; p++) {
-                gpos_t gp = start + p;
-                if (gp >= 0 && gp < genome_len && cov[gp] == 1)
-                    excl_bases++;
-            }
+            int64_t other = prune_count_other_coverage(
+                intervals, (int)n_intervals, s, e, fi, pruned, max_len);
+            int64_t excl  = (int64_t)(e - s) - other;
+            if (excl < 0) excl = 0;             /* defensive */
+            int excl_bases = (int)excl;
 
-            /* Skip instances with <25% exclusive coverage */
+            /* Skip instances with <25% exclusive coverage (matches
+             * original threshold). */
             if (excl_bases < alen / 4) continue;
 
             int edits = (int)(inst->divergence * excl_bases + 0.5f);
@@ -1167,32 +2071,40 @@ int refine_prune_families(CandidateList *cl, glen_t genome_len, int verbose,
         double exclusive_score = exclusive_savings - f->model_cost;
 
         if (exclusive_instances == 0) {
-            /* No exclusive coverage at all — purely redundant */
+            /* No instance has >=25% exclusive coverage — purely redundant.
+             * Mark family pruned; subsequent sweep queries will skip its
+             * intervals, exactly mirroring the original cov[]-- behavior. */
             if (verbose)
                 fprintf(stderr, "  Pruned F%d: excl_score=%.1f "
                         "(model=%.1f, excl_inst=%d)\n",
                         f->id, exclusive_score, f->model_cost,
                         exclusive_instances);
-
-            /* Decrement coverage counts */
-            for (int j = 0; j < f->num_instances; j++) {
-                gpos_t start = f->instances[j].position;
-                int alen = (int)f->instances[j].aligned_length;
-                for (int p = 0; p < alen; p++) {
-                    gpos_t gp = start + p;
-                    if (gp >= 0 && gp < genome_len && cov[gp] > 0)
-                        cov[gp]--;
-                }
-            }
-
+            pruned[fi] = 1;
             f->mdl_score = 0;
             n_pruned++;
         }
     }
 
-    free(cov);
+    free(pruned);
+    free(intervals);
     free(order);
     return n_pruned;
+}
+
+int refine_prune_families(CandidateList *cl, glen_t genome_len, int verbose,
+                          int num_families)
+{
+    /* ENG-N2 + ENG-N10 (QUALITY_PROPOSAL_v6 Tier 1.5b): the previous
+     * implementation allocated a uint8_t[genome_len] coverage counter
+     * (17 GB on wheat) and used an O(n^2) selection sort over n_accepted.
+     * Both are replaced by the sweep-line variant in
+     * refine_prune_families_sweepline, which is memory-bound by the
+     * total number of instance intervals (not genome length) and uses
+     * qsort for ordering.  The numerical decision (prune iff every
+     * instance has <25% exclusive coverage from currently-accepted
+     * families) is preserved exactly. */
+    return refine_prune_families_sweepline(cl, genome_len, verbose,
+                                           num_families);
 }
 
 /* ================================================================
@@ -1212,6 +2124,9 @@ typedef struct {
     int    family_idx;
     int    instance_idx;
     int8_t strand;
+    int    seq_index;     /* ENG-N9: chromosome / sequence identifier so the
+                           * sweep does not pair instances across chr boundaries.
+                           * Used as the primary sort key in cmp_instance_entry. */
 } InstanceEntry;
 
 /* Co-occurrence pair accumulator */
@@ -1232,6 +2147,20 @@ typedef struct {
 
 static int cmp_instance_entry(const void *x, const void *y)
 {
+    /* ENG-N9: primary key seq_index, secondary key start (both ascending).
+     * The sweep loop below relies on sorted order to exit early via a
+     * `break` once entries[j].start - entries[i].start > D.  Sorting by
+     * (seq_index, start) makes that exit fire naturally at every chromo-
+     * some boundary: as soon as j moves into a higher seq_index,
+     * entries[j].start may be small (back to 0) but entries[j].seq_index
+     * differs from entries[i].seq_index, so the cooccurrence loop skips
+     * those and the natural "start - start > D" break catches the very
+     * next same-chr j (or ends the inner loop entirely if i was the last
+     * entry on its chromosome). */
+    int ka = ((const InstanceEntry *)x)->seq_index;
+    int kb = ((const InstanceEntry *)y)->seq_index;
+    if (ka < kb) return -1;
+    if (ka > kb) return  1;
     gpos_t sa = ((const InstanceEntry *)x)->start;
     gpos_t sb = ((const InstanceEntry *)y)->start;
     if (sa < sb) return -1;
@@ -1293,6 +2222,7 @@ int refine_assemble_fragments(CandidateList *cl, const Genome *genome,
             entries[ei].family_idx = i;
             entries[ei].instance_idx = j;
             entries[ei].strand = inst->strand;
+            entries[ei].seq_index = inst->seq_index;  /* ENG-N9 */
             ei++;
         }
     }
@@ -1302,14 +2232,19 @@ int refine_assemble_fragments(CandidateList *cl, const Genome *genome,
           cmp_instance_entry);
 
     /* ---- Step 2: Compute proximity distance D ---- */
-    /* D = median_consensus_length * 2, clamped to [500, 5000] */
+    /* D = median_consensus_length * 4, clamped to [500, 30000].
+     * Was [500, 5000] but observed (chr4 RM benchmark): long LTR-like
+     * truth intervals (>10 kb) often fragment into 4-6 family pieces
+     * spanning 15-30 kb.  A 5 kb proximity cap couldn't see them as
+     * co-occurring; bumping to 30 kb lets the synteny detection see
+     * longer-range patterns. */
     int64_t cons_len_sum = 0;
     for (int i = 0; i < n; i++)
         cons_len_sum += cl->families[i].consensus_length;
     int median_cons = (int)(cons_len_sum / n);
-    int D = median_cons * 2;
-    if (D < 500) D = 500;
-    if (D > 5000) D = 5000;
+    int D = median_cons * 4;
+    if (D < 500)   D = 500;
+    if (D > 30000) D = 30000;
 
     /* ---- Step 3: Sweep-line co-occurrence counting ---- */
     /* Use a hash map of pair -> count. For simplicity, use a flat array
@@ -1342,6 +2277,7 @@ int refine_assemble_fragments(CandidateList *cl, const Genome *genome,
 
         /* Look forward within distance D */
         for (int j = i + 1; j < entries_count; j++) {
+            if (entries[j].seq_index != entries[i].seq_index) break;
             if (entries[j].start - entries[i].start > D) break;
             int fb = entries[j].family_idx;
             if (fa == fb) continue;
@@ -1538,7 +2474,8 @@ int refine_assemble_fragments(CandidateList *cl, const Genome *genome,
             int target_fam = (fi_fam == fa_idx) ? fb_idx : fa_idx;
 
             for (int j = i + 1; j < entries_count; j++) {
-                if (entries[j].start - entries[i].start > D) break;
+                if (entries[j].seq_index != entries[i].seq_index) break;
+            if (entries[j].start - entries[i].start > D) break;
                 if (entries[j].family_idx != target_fam) continue;
 
                 /* Gap: end of first to start of second */
@@ -1593,14 +2530,16 @@ int refine_assemble_fragments(CandidateList *cl, const Genome *genome,
         for (int i = 0; i < entries_count; i++) {
             if (entries[i].family_idx != fa_idx) continue;
             for (int j = i + 1; j < entries_count; j++) {
-                if (entries[j].start - entries[i].start > D) break;
+                if (entries[j].seq_index != entries[i].seq_index) break;
+            if (entries[j].start - entries[i].start > D) break;
                 if (entries[j].family_idx == fb_idx) a_first_count++;
             }
         }
         for (int i = 0; i < entries_count; i++) {
             if (entries[i].family_idx != fb_idx) continue;
             for (int j = i + 1; j < entries_count; j++) {
-                if (entries[j].start - entries[i].start > D) break;
+                if (entries[j].seq_index != entries[i].seq_index) break;
+            if (entries[j].start - entries[i].start > D) break;
                 if (entries[j].family_idx == fa_idx) b_first_count++;
             }
         }
@@ -1764,3 +2703,144 @@ int refine_assemble_fragments(CandidateList *cl, const Genome *genome,
 
     return n_assemblies;
 }
+
+/* ================================================================
+ * Phase 6.5: Tandem-instance coalescing (post-selection reporting)
+ * ================================================================
+ *
+ * Walks each accepted family's instance list and merges consecutive
+ * same-strand instances whose gap < coalesce_factor × consensus_length.
+ * Operates AFTER mdl_select_library + refine_prune_families: this is a
+ * pure reporting transform, NOT a model decision.
+ *
+ * Why: empirical chr4 RM benchmark shows long truth intervals (>10 kb)
+ * are tandem arrays of a single underlying repeat unit.  RM merges them
+ * into one annotation; mdl-repeat naturally emits each copy as its own
+ * instance.  The mismatch tanks interval-level recall even when the bp-
+ * level coverage is fine.  Coalescing aligns reporting with truth
+ * convention.
+ */
+
+typedef struct { gpos_t start; int idx; } InstByStart;
+static int cmp_inst_by_start(const void *a, const void *b)
+{
+    gpos_t sa = ((const InstByStart *)a)->start;
+    gpos_t sb = ((const InstByStart *)b)->start;
+    if (sa < sb) return -1;
+    if (sa > sb) return 1;
+    return 0;
+}
+
+int refine_coalesce_tandem_instances(CandidateList *cl,
+                                     float coalesce_factor,
+                                     int verbose)
+{
+    int total_coalesced = 0;
+    int total_families_affected = 0;
+
+    for (int fi = 0; fi < cl->num_families; fi++) {
+        CandidateFamily *f = &cl->families[fi];
+        if (f->mdl_score <= 0.0)    continue;
+        if (f->num_instances <= 1)  continue;
+
+        int gap_threshold = (int)(coalesce_factor * (float)f->consensus_length);
+        if (gap_threshold < 50) gap_threshold = 50;  /* min sanity */
+
+        /* Sort instances by genome position to enable single-pass scan. */
+        InstByStart *order = malloc((size_t)f->num_instances * sizeof(InstByStart));
+        if (!order) continue;
+        for (int j = 0; j < f->num_instances; j++) {
+            order[j].start = f->instances[j].position;
+            order[j].idx   = j;
+        }
+        qsort(order, (size_t)f->num_instances, sizeof(InstByStart),
+              cmp_inst_by_start);
+
+        /* Walk sorted instances; coalesce successive pairs into the
+         * leftmost.  Mark merged ones with aligned_length = -1 to remove
+         * after the pass. */
+        int family_coalesced = 0;
+        int  active_idx = order[0].idx;
+        Instance *active = &f->instances[active_idx];
+
+        for (int k = 1; k < f->num_instances; k++) {
+            int    cur_idx = order[k].idx;
+            Instance *cur  = &f->instances[cur_idx];
+
+            /* ENG-N8 cross-chromosome guard.  Per R3, the runtime guard
+             * alone (no sort-key change) is sufficient: when we cross
+             * a chromosome boundary just advance the active pointer.
+             * Without this, a tandem-coalesce can fuse instances from
+             * two different sequences whose gpos_t happen to be close,
+             * producing a BED interval that spans a chromosome boundary. */
+            if (cur->seq_index != active->seq_index) {
+                active_idx = cur_idx;
+                active     = cur;
+                continue;
+            }
+
+            gpos_t active_end = active->position + active->aligned_length;
+            int    gap        = (int)(cur->position - active_end);
+
+            if (cur->strand == active->strand &&
+                gap >= -10 &&            /* tiny overlap OK (TSD) */
+                gap <= gap_threshold) {
+                /* Coalesce cur into active */
+                gpos_t new_end = cur->position + cur->aligned_length;
+                if (new_end > active_end) {
+                    glen_t old_alen = active->aligned_length;
+                    active->aligned_length = (glen_t)(new_end - active->position);
+
+                    /* Sum edit counts; keep score additive. */
+                    active->num_edits += cur->num_edits;
+                    /* Add gap as edit-equivalent (insertions in the
+                     * tandem-array spacer are real edits relative to
+                     * a tandem-coalesced consensus interpretation). */
+                    if (gap > 0) active->num_edits += gap;
+
+                    /* Recompute divergence as edits / new aligned_length. */
+                    if (active->aligned_length > 0) {
+                        active->divergence =
+                            (float)active->num_edits /
+                            (float)active->aligned_length;
+                        if (active->divergence > 1.0f) active->divergence = 1.0f;
+                    }
+                    active->cons_end   = active->cons_end > cur->cons_end
+                                       ? active->cons_end : cur->cons_end;
+                    active->score     += cur->score;
+                    (void)old_alen;
+                }
+                /* Mark cur as removed */
+                cur->aligned_length = -1;
+                family_coalesced++;
+            } else {
+                /* Move active forward */
+                active_idx = cur_idx;
+                active     = cur;
+            }
+        }
+
+        free(order);
+
+        /* Compact: remove instances with aligned_length == -1. */
+        if (family_coalesced > 0) {
+            int wi = 0;
+            for (int j = 0; j < f->num_instances; j++) {
+                if (f->instances[j].aligned_length < 0) continue;
+                if (wi != j) f->instances[wi] = f->instances[j];
+                wi++;
+            }
+            f->num_instances = wi;
+            total_coalesced += family_coalesced;
+            total_families_affected++;
+        }
+    }
+
+    if (verbose && total_coalesced > 0) {
+        fprintf(stderr,
+                "Tandem coalescing: merged %d instance pairs across %d families\n",
+                total_coalesced, total_families_affected);
+    }
+    return total_coalesced;
+}
+

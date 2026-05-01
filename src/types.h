@@ -21,7 +21,6 @@ typedef int32_t uid_t;     /* unitig/family ID */
 /* --- Constants --- */
 #define PADLENGTH       11000   /* must be >= max extension distance */
 #define DEFAULT_TANDEMDIST  500
-#define DEFAULT_MINTHRESH   3
 #define DEFAULT_MAXN        10000   /* max instances per candidate */
 
 /* --- Inline DNA helpers (carried from RepeatScout) --- */

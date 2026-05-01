@@ -88,20 +88,34 @@ typedef struct {
 } MDLResult;
 
 /*
- * MDL-based library selection with iterative R convergence.
+ * MDL-based library selection with greedy unique-coverage acceptance
+ * and a standalone-fallback gate (Stage B fix 1).
  *
- * R (number of accepted families) and per-instance costs are circularly
- * dependent: scores depend on ceil(log2(R)), but R depends on scores.
- * We iterate up to 3 times until R converges.
+ * Algorithm:
+ * 1. Score every candidate family (single pass — see mdl_select_library
+ *    implementation for why the historical iterative R-convergence loop
+ *    was removed).
+ * 2. Sort by raw mdl_score descending.
+ * 3. Walk in order; for each family compute its EXCLUSIVE savings using
+ *    only positions not yet claimed by a higher-scoring family.  Accept
+ *    iff EITHER (a) exclusive_savings > model_cost  OR
+ *    (b) standalone score > 0 AND consensus_length >= 50 AND
+ *        num_instances >= 3.
+ *    Mark accepted instances' positions as claimed before moving on.
+ * 4. The accepted family's mdl_score is rewritten to the exclusive
+ *    score (when (a) applies) or left at the standalone score (when
+ *    only (b) applies); rejected families have mdl_score zeroed.
+ * 5. Library cost includes L_int(R) for encoding the number of families.
  *
- * 1. Score all families with current R estimate
- * 2. Count accepted (score > 0 and >= 2 instances)
- * 3. If accepted count changed, re-score with new R; else converge
- * 4. Compute unique coverage via bitmap (reporting only)
+ * The unique-coverage step is required for correctness of the two-part
+ * MDL code: each genome position must be encoded by at most one family.
+ * Naive per-instance accumulation double-counts overlap and produces
+ * compression_ratio outside [0, 1].  Only EXCLUSIVE savings ever feed
+ * the cumulative DL — even families accepted via the standalone-fallback
+ * (b) contribute zero savings to the running total when they have no
+ * exclusive bases, preserving the two-part bound.
  *
- * Library cost includes L_int(R) for encoding the number of families.
- *
- * Modifies candidates in place (reorders, updates scores).
+ * Modifies candidates in place (reorders, rewrites mdl_score).
  * Returns the MDL result summary.
  */
 MDLResult mdl_select_library(CandidateList *cl, glen_t genome_len);

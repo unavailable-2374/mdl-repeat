@@ -55,6 +55,7 @@ void discover_default_params(DiscoverParams *params);
  * Returns NULL on failure.
  */
 CandidateList *discover_families(const Genome *genome,
-                                 const DiscoverParams *params);
+                                 const DiscoverParams *params,
+                                 int num_threads);
 
 #endif /* MDL_DISCOVER_H */

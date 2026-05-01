@@ -11,7 +11,7 @@
  *     (RepeatScout hardcodes bStart=0; bEnd=50000000)
  *   - repeatllist.value: dynamically allocated (fixes overflow when l > 19)
  *
- * The discovery loop is single-threaded (masking global state requires it).
+ * Thread-safe: all mutable state lives in DiscoverContext (heap-allocated).
  */
 
 #include <stdio.h>
@@ -19,110 +19,15 @@
 #include <string.h>
 #include <math.h>
 
-#include "discover.h"
+#include "discover_internal.h"
+#include "kmer.h"
 
 /* ================================================================
- * Constants
+ * Cross-module helpers (decls in discover_internal.h).  These are
+ * NOT static — discover_mask.c calls them.
  * ================================================================ */
 
-#define HASH_SIZE       16000057   /* prime, same as RepeatScout */
-#define SMALLHASH_SIZE  5003       /* prime, for mask consensus lookup */
-#define SMALLL          6          /* length of small hash l-mers */
-#define EXTRAMASK       1          /* extend mask region by l-1 on each side */
-
-/* ================================================================
- * Internal hash table types (RepeatScout convention)
- * ================================================================ */
-
-struct posllist {
-    int this;
-    struct posllist *next;
-};
-
-struct llist {
-    int freq;
-    int lastocc;
-    int lastplusocc;       /* last forward-strand occurrence position */
-    int lastminusocc;      /* last reverse-complement occurrence position */
-    struct llist *next;
-    struct posllist *pos;
-};
-
-/* Fixed: dynamic value[] instead of char value[20] */
-struct repeatllist {
-    char *value;           /* dynamically allocated, length = l */
-    int   repeatpos;
-    struct repeatllist *next;
-};
-
-/* ================================================================
- * Static workspace (file-scoped, single-threaded)
- * ================================================================ */
-
-/* Parameters */
-static int l;                  /* l-mer length */
-static int L;                  /* max extension per side */
-static int MAXOFFSET;
-static int MAXN;
-static int MAXR;
-static int MATCH;
-static int MISMATCH;
-static int GAP;
-static int CAPPENALTY;
-static int MINIMPROVEMENT;
-static int WHEN_TO_STOP;
-static float MAXENTROPY;
-static int GOODLENGTH;
-static int MINTHRESH;
-static int TANDEMDIST;
-static int VERBOSE;
-
-/* Genome data */
-static char *sequence;          /* doubled genome: forward + PAD + RC */
-static char *sequence_owned;    /* if non-NULL, we allocated this (for doubling) */
-static char *removed;           /* masking bitmap, length = doubled genome length */
-static int   length;            /* total length (doubled: 2*orig + PADLENGTH) */
-static int   orig_length;       /* original genome length (before doubling) */
-static int  *disc_boundaries;   /* pre-padding boundary positions (int copy) */
-static int   disc_num_sequences;
-
-/* Extension workspace */
-static char  *master;           /* [2*L+l] working consensus */
-static char **masters;          /* [MAXR] saved consensus arrays */
-static int   *masters_allocated;/* [MAXR] allocation flags */
-static int   *masterstart;      /* [MAXR] consensus start in master coords */
-static int   *masterend;        /* [MAXR] consensus end in master coords */
-
-static int   *pos;              /* [MAXN] occurrence positions */
-static char  *rev;              /* [MAXN] strand flags (0=fwd, 1=rev) */
-static int   *upperBoundI;      /* [MAXN] boundary index per occurrence */
-static int    N;                /* current number of occurrences */
-
-static int ***score;            /* [2][MAXN][2*MAXOFFSET+1] DP scores */
-static int  **score_of_besty;   /* [MAXN][2*MAXOFFSET+1] checkpoint scores */
-static int  **maskscore;        /* [2][2*MAXOFFSET+1] mask DP scores */
-
-static int    totalbestscore;
-static int    besttotalbestscore;
-static int   *bestbestscore;    /* [MAXN] per-occurrence best scores */
-static int   *savebestscore;    /* [MAXN] checkpoint of bestbestscore */
-
-static int   *best_left_offset; /* [MAXN] */
-static int   *save_left_offset; /* [MAXN] */
-static int   *best_right_offset;/* [MAXN] */
-static int   *save_right_offset;/* [MAXN] */
-
-static int    besty, bestw;
-static int    nrepeatocc, nactiverepeatocc;
-static int    bestnrepeatocc, bestnactiverepeatocc;
-static int    R;
-static int    prevbestfreq, prevbesthash;
-
-/* ================================================================
- * DNA utility functions
- * ================================================================ */
-
-static inline char compl_base(char c)
+char compl_base(char c)
 {
     if (c == DNA_N) return DNA_N;
     return 3 - c;
@@ -132,24 +37,24 @@ static inline char compl_base(char c)
  * Hash functions (symmetric w.r.t. reverse complement)
  * ================================================================ */
 
-static int hash_function(const char *lmer)
+int hash_function(DiscoverContext *C, const char *lmer)
 {
     int x, ans, ans2;
 
-    for (x = 0; x < l; x++)
+    for (x = 0; x < C->l; x++)
         if (lmer[x] == DNA_N) return -1;
 
     ans = 0;
-    for (x = 0; x < l; x++)
-        ans = (4 * ans + (lmer[x] % 4)) % HASH_SIZE;
+    for (x = 0; x < C->l; x++)
+        ans = (4 * ans + (lmer[x] % 4)) % (int)C->hash_size;
     ans2 = 0;
-    for (x = 0; x < l; x++)
-        ans2 = (4 * ans2 + ((3 - lmer[l - 1 - x]) % 4)) % HASH_SIZE;
+    for (x = 0; x < C->l; x++)
+        ans2 = (4 * ans2 + ((3 - lmer[C->l - 1 - x]) % 4)) % (int)C->hash_size;
     if (ans2 > ans) ans = ans2;
     return ans;
 }
 
-static int smallhash_function(const char *lmer)
+int smallhash_function(const char *lmer)
 {
     int x, ans;
 
@@ -163,30 +68,27 @@ static int smallhash_function(const char *lmer)
 }
 
 /* ================================================================
- * L-mer matching functions
+ * L-mer matching functions (cross-module — see discover_internal.h)
  * ================================================================ */
 
-/* Exact forward match */
-static int lmermatch(const char *lmer1, const char *lmer2)
+int lmermatch(DiscoverContext *C, const char *lmer1, const char *lmer2)
 {
-    for (int x = 0; x < l; x++)
+    for (int x = 0; x < C->l; x++)
         if (lmer1[x] != lmer2[x]) return 0;
     return 1;
 }
 
-/* Reverse complement match */
-static int lmermatchrc(const char *lmer1, const char *lmer2)
+int lmermatchrc(DiscoverContext *C, const char *lmer1, const char *lmer2)
 {
-    for (int x = 0; x < l; x++)
-        if (lmer1[x] + lmer2[l - 1 - x] != 3) return 0;
+    for (int x = 0; x < C->l; x++)
+        if (lmer1[x] + lmer2[C->l - 1 - x] != 3) return 0;
     return 1;
 }
 
-/* Forward or reverse complement match */
-static int lmermatcheither(const char *lmer1, const char *lmer2)
+int lmermatcheither(DiscoverContext *C, const char *lmer1, const char *lmer2)
 {
-    for (int x = 0; x < l; x++)
-        if (lmer1[x] != lmer2[x]) return lmermatchrc(lmer1, lmer2);
+    for (int x = 0; x < C->l; x++)
+        if (lmer1[x] != lmer2[x]) return lmermatchrc(C, lmer1, lmer2);
     return 1;
 }
 
@@ -194,39 +96,72 @@ static int lmermatcheither(const char *lmer1, const char *lmer2)
  * Entropy (Shannon, natural log — returns negative value)
  * ================================================================ */
 
-static double compute_entropy(const char *lmer)
+static double compute_entropy(DiscoverContext *C, const char *lmer)
 {
     int count[4] = {0, 0, 0, 0};
     double answer = 0.0;
 
-    for (int x = 0; x < l; x++)
+    for (int x = 0; x < C->l; x++)
         count[(int)lmer[x]] += 1;
 
     for (int x = 0; x < 4; x++) {
         if (count[x] == 0) continue;
-        double y = (double)count[x] / (double)l;
+        double y = (double)count[x] / (double)C->l;
         answer += y * log(y);
     }
     return answer;
 }
 
 /* ================================================================
+ * Periodicity filter — reject l-mers with short tandem period
+ * ================================================================
+ *
+ * The Shannon entropy filter (compute_entropy) catches l-mers with
+ * unbalanced base composition such as (A)n or (CG)n.  It does NOT
+ * catch periodic l-mers with balanced composition such as (GAGA)n,
+ * (ATCATC)n, or (CAG)n: their per-base distribution can be uniform
+ * yet the sequence is a simple tandem repeat that should not seed
+ * a discovery.  Without this guard, simple-repeat seeds dominate
+ * the high-frequency end of the seed pool and produce dozens of
+ * spurious candidate families.
+ *
+ * Returns the smallest period in [1, l/2] for which the l-mer is
+ * >= PERIODIC_MATCH_PCT identical to itself shifted by that period,
+ * or 0 if no such period exists.
+ */
+#define PERIODIC_MATCH_PCT 85
+
+static int is_periodic_lmer(const char *lmer, int l)
+{
+    if (l < 4) return 0;
+    for (int p = 1; p <= l / 2; p++) {
+        int compares = l - p;
+        if (compares < 4) continue;
+        int matches = 0;
+        for (int i = 0; i < compares; i++)
+            if (lmer[i] == lmer[i + p]) matches++;
+        if (matches * 100 >= compares * PERIODIC_MATCH_PCT) return p;
+    }
+    return 0;
+}
+
+/* ================================================================
  * Sequence boundary helper (FIXED — no hardcoded override)
  * ================================================================ */
 
-static void get_boundaries(int n, int *bStart_out, int *bEnd_out)
+static void get_boundaries(DiscoverContext *C, int n, gpos_t *bStart_out, gpos_t *bEnd_out)
 {
-    int bStart = PADLENGTH;
-    int bEnd;
+    gpos_t bStart = PADLENGTH;
+    gpos_t bEnd;
 
-    if (upperBoundI[n] == -1) {
+    if (C->upperBoundI[n] == -1) {
         /* Defensive: position past all boundaries */
         bStart = PADLENGTH;
-        bEnd = length;
+        bEnd = C->length;
     } else {
-        if (upperBoundI[n] > 0)
-            bStart = disc_boundaries[upperBoundI[n] - 1] + PADLENGTH;
-        bEnd = disc_boundaries[upperBoundI[n]] + PADLENGTH;
+        if (C->upperBoundI[n] > 0)
+            bStart = C->disc_boundaries[C->upperBoundI[n] - 1] + PADLENGTH;
+        bEnd = C->disc_boundaries[C->upperBoundI[n]] + PADLENGTH;
     }
 
     /* RepeatScout bug: bStart=0; bEnd=50000000; — NOT applied here */
@@ -239,31 +174,32 @@ static void get_boundaries(int n, int *bStart_out, int *bEnd_out)
  * Find sequence index for a padded position
  * ================================================================ */
 
-static int find_seq_index(int padded_pos)
+static int find_seq_index(DiscoverContext *C, gpos_t padded_pos)
 {
-    int raw = padded_pos - PADLENGTH;
+    gpos_t raw = padded_pos - PADLENGTH;
     if (raw < 0) return -1;
 
-    for (int i = 0; i < disc_num_sequences; i++) {
+    for (int i = 0; i < C->disc_num_sequences; i++) {
         if (i == 0) {
-            if (raw < disc_boundaries[0]) return 0;
+            if (raw < C->disc_boundaries[0]) return 0;
         } else {
-            if (raw >= disc_boundaries[i - 1] && raw < disc_boundaries[i])
+            if (raw >= C->disc_boundaries[i - 1] && raw < C->disc_boundaries[i])
                 return i;
         }
     }
-    return disc_num_sequences - 1;
+    return C->disc_num_sequences - 1;
 }
 
 /* ================================================================
  * Hash table: read from .freq file (RepeatScout format)
  * ================================================================ */
 
-static void build_headptr_from_freq(struct llist **headptr, const char *freq_file)
+static void build_headptr_from_freq(DiscoverContext *C, struct llist **headptr, const char *freq_file)
 {
     FILE *fp;
     char string[1000];
-    int thisfreq, thisocc, x, h;
+    int thisfreq, x, h;
+    gpos_t thisocc;
     struct llist *tmp;
 
     fp = fopen(freq_file, "r");
@@ -272,7 +208,7 @@ static void build_headptr_from_freq(struct llist **headptr, const char *freq_fil
         exit(1);
     }
 
-    for (h = 0; h < HASH_SIZE; h++)
+    for (h = 0; h < C->hash_size; h++)
         headptr[h] = NULL;
 
     while (1) {
@@ -281,34 +217,36 @@ static void build_headptr_from_freq(struct llist **headptr, const char *freq_fil
             fprintf(stderr, "discover: error reading frequency from %s\n", freq_file);
             exit(1);
         }
-        if (fscanf(fp, "%d", &thisocc) != 1) {
+        if (fscanf(fp, "%" SCNd64, &thisocc) != 1) {
             fprintf(stderr, "discover: error reading occurrence from %s\n", freq_file);
             exit(1);
         }
 
-        if ((int)strlen(string) != l) {
+        if ((int)strlen(string) != C->l) {
             fprintf(stderr, "discover: l-mer length mismatch: expected %d, got %d\n",
-                    l, (int)strlen(string));
+                    C->l, (int)strlen(string));
             exit(1);
         }
 
-        for (x = 0; x < l; x++)
+        for (x = 0; x < C->l; x++)
             string[x] = char_to_num(string[x]);
 
-        h = hash_function(string);
+        h = hash_function(C, string);
         if (h < 0) continue;
 
         /* Check if already present (duplicate = end of useful data) */
         tmp = headptr[h];
         while (tmp != NULL) {
-            if (lmermatcheither(sequence + tmp->lastocc, string) == 1)
+            if (lmermatcheither(C, C->sequence + tmp->lastocc, string) == 1)
                 break;
             tmp = tmp->next;
         }
         if (tmp != NULL) break; /* already in table — done */
 
         /* Entropy filter */
-        if (compute_entropy(sequence + thisocc) > MAXENTROPY) continue;
+        if (compute_entropy(C, C->sequence + thisocc) > C->MAXENTROPY) continue;
+        /* Periodicity filter — reject simple-repeat seeds (e.g. GAGAGA) */
+        if (is_periodic_lmer(C->sequence + thisocc, C->l)) continue;
 
         tmp = malloc(sizeof(*tmp));
         if (tmp == NULL) { fprintf(stderr, "discover: out of memory\n"); exit(1); }
@@ -328,12 +266,13 @@ static void build_headptr_from_freq(struct llist **headptr, const char *freq_fil
  * Hash table: internal counting (no .freq file)
  * ================================================================ */
 
-static void build_headptr_internal(struct llist **headptr)
+static void build_headptr_internal(DiscoverContext *C, struct llist **headptr)
 {
-    int h, x;
+    int h;
+    gpos_t x;
     struct llist *tmp;
 
-    for (h = 0; h < HASH_SIZE; h++)
+    for (h = 0; h < C->hash_size; h++)
         headptr[h] = NULL;
 
     /*
@@ -341,24 +280,24 @@ static void build_headptr_internal(struct llist **headptr)
      * matching RepeatScout's build_lmer_table behavior.
      * Only scan the forward copy (not the RC copy in doubled genome).
      */
-    int count_end = orig_length - l;
+    gpos_t count_end = C->orig_length - C->l;
     for (x = PADLENGTH; x <= count_end; x++) {
-        h = hash_function(sequence + x);
+        h = hash_function(C, C->sequence + x);
         if (h < 0) continue;
 
         /* Check if already in table */
         tmp = headptr[h];
         while (tmp != NULL) {
-            if (lmermatch(sequence + tmp->lastplusocc, sequence + x)) {
+            if (lmermatch(C, C->sequence + tmp->lastplusocc, C->sequence + x)) {
                 /* Forward match: TANDEMDIST check against lastplusocc */
-                if (x - tmp->lastplusocc >= TANDEMDIST)
+                if (x - tmp->lastplusocc >= C->TANDEMDIST)
                     tmp->freq++;
                 tmp->lastplusocc = x;
                 tmp->lastocc = x;
                 break;
-            } else if (lmermatchrc(sequence + tmp->lastplusocc, sequence + x)) {
+            } else if (lmermatchrc(C, C->sequence + tmp->lastplusocc, C->sequence + x)) {
                 /* Reverse complement match: TANDEMDIST check against lastminusocc */
-                if (x - tmp->lastminusocc >= TANDEMDIST)
+                if (x - tmp->lastminusocc >= C->TANDEMDIST)
                     tmp->freq++;
                 tmp->lastminusocc = x;
                 tmp->lastocc = x;
@@ -368,8 +307,9 @@ static void build_headptr_internal(struct llist **headptr)
         }
 
         if (tmp == NULL) {
-            /* New entry — apply entropy filter */
-            if (compute_entropy(sequence + x) > MAXENTROPY) continue;
+            /* New entry — apply entropy + periodicity filters */
+            if (compute_entropy(C, C->sequence + x) > C->MAXENTROPY) continue;
+            if (is_periodic_lmer(C->sequence + x, C->l)) continue;
 
             tmp = malloc(sizeof(*tmp));
             if (tmp == NULL) { fprintf(stderr, "discover: out of memory\n"); exit(1); }
@@ -385,19 +325,151 @@ static void build_headptr_internal(struct llist **headptr)
 }
 
 /* ================================================================
+ * Hash table: parallel l-mer counting via kmer.c striped-lock hash
+ *
+ * Option γ adapter: replaces the O(N) serial scan in
+ * build_headptr_internal with a parallel kmer_count() call, then
+ * translates surviving KmerEntry records into the discover.c llist
+ * structure expected by the rest of the pipeline.
+ *
+ * Scan range matches build_headptr_internal: only the forward copy
+ * of the doubled genome ([PADLENGTH, orig_length)).
+ * ================================================================ */
+
+static void build_headptr_parallel(DiscoverContext *C,
+                                   struct llist **headptr,
+                                   int num_threads)
+{
+    int h;
+
+    for (h = 0; h < C->hash_size; h++)
+        headptr[h] = NULL;
+
+    /* Build a temporary Genome wrapping the forward (non-doubled) copy.
+     * kmer.c's kmer_count scans [PADLENGTH, length - k + 1), so length
+     * must be C->orig_length (NOT C->length which covers the RC copy). */
+    Genome tmp_genome;
+    memset(&tmp_genome, 0, sizeof(tmp_genome));
+    tmp_genome.sequence      = C->sequence_owned;
+    tmp_genome.length        = C->orig_length;
+    tmp_genome.raw_length    = C->orig_length - PADLENGTH;
+    tmp_genome.boundaries    = C->disc_boundaries;
+    tmp_genome.num_sequences = C->disc_num_sequences;
+    tmp_genome.sequence_ids  = NULL;
+
+    KmerTable *kt = kmer_count(&tmp_genome, C->l, C->TANDEMDIST, num_threads);
+    if (kt == NULL) {
+        fprintf(stderr, "discover: parallel kmer_count failed\n");
+        exit(1);
+    }
+
+    /* Decode buffer for unpacking 2-bit kmers back to 0-3 char[] */
+    char decoded[64];
+    if (C->l > 64) {
+        fprintf(stderr, "discover: l=%d exceeds decode buffer (64)\n", C->l);
+        kmer_free(kt);
+        exit(1);
+    }
+
+    for (size_t b = 0; b < kt->table_size; b++) {
+        KmerEntry *e = kt->buckets[b];
+        while (e != NULL) {
+            /* Skip below-threshold early to avoid pointless decode/alloc */
+            if (e->frequency < C->MINTHRESH) {
+                e = e->next;
+                continue;
+            }
+
+            /* Decode packed canonical kmer back to char[l] (0-3 encoding).
+             * MSB-first packing means the highest 2 bits encode index 0;
+             * unpack from index l-1 downward. Use a local copy so we
+             * don't mutate the entry. */
+            uint64_t k = e->kmer;
+            for (int i = C->l - 1; i >= 0; i--) {
+                decoded[i] = (char)(k & 3);
+                k >>= 2;
+            }
+
+            /* Apply discover-side filters that kmer.c does not know about.
+             * compute_entropy and is_periodic_lmer accept char[] in
+             * 0-3 encoding, exactly what we just produced. */
+            if (compute_entropy(C, decoded) > C->MAXENTROPY) {
+                e = e->next;
+                continue;
+            }
+            if (is_periodic_lmer(decoded, C->l)) {
+                e = e->next;
+                continue;
+            }
+
+            int hh = hash_function(C, decoded);
+            if (hh < 0) {
+                e = e->next;
+                continue;
+            }
+
+            /* Defensive: skip if already present in headptr[hh].
+             * kmer.c canonicalises and deduplicates, so this should
+             * not happen, but a stray hash collision via the asymmetric
+             * canonical forms could in principle produce one. */
+            struct llist *existing = headptr[hh];
+            int dup = 0;
+            while (existing != NULL) {
+                if (lmermatcheither(C, C->sequence + existing->lastocc, decoded)) {
+                    dup = 1;
+                    break;
+                }
+                existing = existing->next;
+            }
+            if (dup) {
+                e = e->next;
+                continue;
+            }
+
+            /* Choose lastocc: prefer plus, fall back to minus if plus is
+             * the sentinel (-1000000), in which case the kmer was only
+             * seen on the RC strand. */
+            gpos_t lastocc;
+            if (e->last_plus_occ >= PADLENGTH)
+                lastocc = e->last_plus_occ;
+            else
+                lastocc = e->last_minus_occ;
+
+            struct llist *node = malloc(sizeof(*node));
+            if (node == NULL) {
+                fprintf(stderr, "discover: out of memory in build_headptr_parallel\n");
+                kmer_free(kt);
+                exit(1);
+            }
+            node->freq         = e->frequency;
+            node->lastocc      = lastocc;
+            node->lastplusocc  = e->last_plus_occ;
+            node->lastminusocc = e->last_minus_occ;
+            node->pos          = NULL;
+            node->next         = headptr[hh];
+            headptr[hh] = node;
+
+            e = e->next;
+        }
+    }
+
+    kmer_free(kt);
+}
+
+/* ================================================================
  * Trim: remove l-mers with freq < MINTHRESH, reset freq to 0
  * ================================================================ */
 
-static void trim_headptr(struct llist **headptr)
+static void trim_headptr(DiscoverContext *C, struct llist **headptr)
 {
     int h;
     struct llist *tmp, *prevtmp, *nexttmp;
 
-    for (h = 0; h < HASH_SIZE; h++) {
+    for (h = 0; h < C->hash_size; h++) {
         prevtmp = NULL;
         tmp = headptr[h];
         while (tmp != NULL) {
-            if (tmp->freq >= MINTHRESH) {
+            if (tmp->freq >= C->MINTHRESH) {
                 /* Keep, but reset freq for rebuild by build_all_pos */
                 tmp->freq = 0;
                 prevtmp = tmp;
@@ -421,31 +493,32 @@ static void trim_headptr(struct llist **headptr)
  * (Exact port of RepeatScout build_all_pos, lines 613-743)
  * ================================================================ */
 
-static void build_all_pos(struct llist **headptr)
+static void build_all_pos(DiscoverContext *C, struct llist **headptr)
 {
-    int x, h, pos1, pos2;
+    gpos_t x, pos1, pos2;
+    int h;
     struct llist *tmp;
     struct posllist *postmp, *postmp2, *prevpostmp, *nextpostmp;
     int currBoundary = 0;
 
-    if (VERBOSE) fprintf(stderr, "discover: building all positions...\n");
+    if (C->VERBOSE) fprintf(stderr, "discover: building all positions...\n");
 
     /* Pass 1: scan genome, add positions to matching l-mers */
-    for (x = l - 1; x < length - l + 1; x++) {
+    for (x = C->l - 1; x < C->length - C->l + 1; x++) {
         /* Check sequence boundaries */
-        if (disc_boundaries[currBoundary] > 0) {
-            if (x == disc_boundaries[currBoundary] + PADLENGTH)
+        if (C->disc_boundaries[currBoundary] > 0) {
+            if (x == C->disc_boundaries[currBoundary] + PADLENGTH)
                 currBoundary++;
-            if (x + l > disc_boundaries[currBoundary] + PADLENGTH)
+            if (x + C->l > C->disc_boundaries[currBoundary] + PADLENGTH)
                 continue;
         }
 
-        h = hash_function(sequence + x);
+        h = hash_function(C, C->sequence + x);
         if (h < 0) continue;
 
         tmp = headptr[h];
         while (tmp != NULL) {
-            if (lmermatcheither(sequence + tmp->lastocc, sequence + x)) {
+            if (lmermatcheither(C, C->sequence + tmp->lastocc, C->sequence + x)) {
                 /* Hit: add position */
                 postmp = malloc(sizeof(*postmp));
                 if (postmp == NULL) {
@@ -460,10 +533,10 @@ static void build_all_pos(struct llist **headptr)
         }
     }
 
-    if (VERBOSE) fprintf(stderr, "discover: TANDEMDIST filtering...\n");
+    if (C->VERBOSE) fprintf(stderr, "discover: TANDEMDIST filtering...\n");
 
     /* Pass 2: remove position pairs within TANDEMDIST (same strand only) */
-    for (h = 0; h < HASH_SIZE; h++) {
+    for (h = 0; h < C->hash_size; h++) {
         tmp = headptr[h];
         while (tmp != NULL) {
             /* Mark within-TANDEMDIST same-strand pairs as negative */
@@ -473,9 +546,9 @@ static void build_all_pos(struct llist **headptr)
                 postmp2 = postmp;
                 while ((postmp2 = postmp2->next) != NULL) {
                     pos2 = postmp2->this;
-                    if (pos1 - pos2 >= TANDEMDIST)
+                    if (pos1 - pos2 >= C->TANDEMDIST)
                         break;
-                    if (lmermatch(sequence + pos1, sequence + pos2)) {
+                    if (lmermatch(C, C->sequence + pos1, C->sequence + pos2)) {
                         postmp->this = -pos1;
                         break;
                     }
@@ -492,10 +565,12 @@ static void build_all_pos(struct llist **headptr)
                     postmp = postmp->next;
                     continue;
                 }
-                /* Remove */
+                /* Remove (TANDEMDIST-pruned) — use permanent sentinel
+                 * so this position never becomes available to any
+                 * future seed regardless of MAX_FAMILY_CLAIMS. */
                 nextpostmp = postmp->next;
                 tmp->freq--;
-                removed[-postmp->this] = 1;
+                C->removed[-postmp->this] = CLAIM_PERMANENT;
                 free(postmp);
                 postmp = nextpostmp;
                 if (prevpostmp == NULL)
@@ -508,7 +583,7 @@ static void build_all_pos(struct llist **headptr)
         }
     }
 
-    if (VERBOSE) fprintf(stderr, "discover: position building complete\n");
+    if (C->VERBOSE) fprintf(stderr, "discover: position building complete\n");
 }
 
 /* ================================================================
@@ -516,18 +591,18 @@ static void build_all_pos(struct llist **headptr)
  * (Exact port of RepeatScout find_besttmp, lines 748-788)
  * ================================================================ */
 
-static struct llist *find_besttmp(struct llist **headptr)
+static struct llist *find_besttmp(DiscoverContext *C, struct llist **headptr)
 {
     int h;
     struct llist *tmp, *besttmp;
     int bestfreq;
 
     /* Try to match prevbestfreq first (locality optimization) */
-    for (h = prevbesthash; h < HASH_SIZE; h++) {
+    for (h = C->prevbesthash; h < C->hash_size; h++) {
         tmp = headptr[h];
         while (tmp != NULL) {
-            if (tmp->freq == prevbestfreq) {
-                prevbesthash = h;
+            if (tmp->freq == C->prevbestfreq) {
+                C->prevbesthash = h;
                 return tmp;
             }
             tmp = tmp->next;
@@ -537,18 +612,18 @@ static struct llist *find_besttmp(struct llist **headptr)
     /* Global search for max freq */
     besttmp = NULL;
     bestfreq = 0;
-    for (h = 0; h < HASH_SIZE; h++) {
+    for (h = 0; h < C->hash_size; h++) {
         tmp = headptr[h];
         while (tmp != NULL) {
             if (tmp->freq > bestfreq) {
                 besttmp = tmp;
                 bestfreq = tmp->freq;
-                prevbesthash = h;
+                C->prevbesthash = h;
             }
             tmp = tmp->next;
         }
     }
-    prevbestfreq = bestfreq;
+    C->prevbestfreq = bestfreq;
     return besttmp;
 }
 
@@ -557,36 +632,39 @@ static struct llist *find_besttmp(struct llist **headptr)
  * (Exact port of RepeatScout build_pos, lines 996-1032)
  * ================================================================ */
 
-static void build_pos(struct llist *besttmp)
+static void build_pos(DiscoverContext *C, struct llist *besttmp)
 {
     struct posllist *postmp;
     int x;
 
     postmp = besttmp->pos;
-    N = 0;
+    C->N = 0;
     while (postmp != NULL) {
-        if (removed[postmp->this] == 0) {
-            pos[N] = postmp->this;
+        /* Coverage-aware: allow positions claimed by < MAX_FAMILY_CLAIMS
+         * families.  CLAIM_PERMANENT sentinel keeps TANDEMDIST-pruned
+         * positions excluded. */
+        if (C->removed[postmp->this] < MAX_FAMILY_CLAIMS) {
+            C->pos[C->N] = postmp->this;
 
             /* Strand determination: lmermatch = forward, else reverse */
-            if (lmermatch(sequence + besttmp->lastocc, sequence + postmp->this))
-                rev[N] = 0;
+            if (lmermatch(C, C->sequence + besttmp->lastocc, C->sequence + postmp->this))
+                C->rev[C->N] = 0;
             else
-                rev[N] = 1;
+                C->rev[C->N] = 1;
 
             /* Find upper boundary index */
-            upperBoundI[N] = -1;
+            C->upperBoundI[C->N] = -1;
             x = 0;
-            while (disc_boundaries[x] != 0) {
-                if (disc_boundaries[x] + PADLENGTH > pos[N]) {
-                    upperBoundI[N] = x;
+            while (C->disc_boundaries[x] != 0) {
+                if (C->disc_boundaries[x] + PADLENGTH > C->pos[C->N]) {
+                    C->upperBoundI[C->N] = x;
                     break;
                 }
                 x++;
             }
 
-            N++;
-            if (N == MAXN) break;
+            C->N++;
+            if (C->N == C->MAXN) break;
         }
         postmp = postmp->next;
     }
@@ -597,63 +675,63 @@ static void build_pos(struct llist *besttmp)
  * (Exact port of RepeatScout lines 1877-1969, with boundary fix)
  * ================================================================ */
 
-static int compute_score_right(int y, int n, int offset, char a)
+static int compute_score_right(DiscoverContext *C, int y, int n, int offset, char a)
 {
     int oldoffset, tempscore, ans, ismatch, x;
-    int bStart, bEnd;
+    gpos_t bStart, bEnd;
 
-    get_boundaries(n, &bStart, &bEnd);
+    get_boundaries(C, n, &bStart, &bEnd);
 
     /* Boundary check */
-    if (rev[n]) {
-        if (pos[n] - (offset + y - L - l) - 1 < bStart)
+    if (C->rev[n]) {
+        if (C->pos[n] - (offset + y - C->L - C->l) - 1 < bStart)
             return 0;
     } else {
-        if (pos[n] + offset + y - L >= bEnd)
+        if (C->pos[n] + offset + y - C->L >= bEnd)
             return 0;
     }
 
     ans = -1000000000;
 
     /* Case A: gap in sequence (oldoffset = offset+1) */
-    if (offset < MAXOFFSET) {
+    if (offset < C->MAXOFFSET) {
         oldoffset = offset + 1;
-        tempscore = score[(y - 1) % 2][n][oldoffset + MAXOFFSET] + GAP;
+        tempscore = C->score[(y - 1) % 2][n][oldoffset + C->MAXOFFSET] + C->GAP;
         if (tempscore > ans) ans = tempscore;
     }
 
     /* Case B: diagonal match/mismatch (oldoffset = offset) */
     oldoffset = offset;
-    tempscore = score[(y - 1) % 2][n][oldoffset + MAXOFFSET];
-    if (rev[n]) {
-        if (a == compl_base(sequence[pos[n] - (offset + y - L - l) - 1]))
-            tempscore += MATCH;
+    tempscore = C->score[(y - 1) % 2][n][oldoffset + C->MAXOFFSET];
+    if (C->rev[n]) {
+        if (a == compl_base(C->sequence[C->pos[n] - (offset + y - C->L - C->l) - 1]))
+            tempscore += C->MATCH;
         else
-            tempscore += MISMATCH;
+            tempscore += C->MISMATCH;
     } else {
-        if (a == sequence[pos[n] + offset + y - L])
-            tempscore += MATCH;
+        if (a == C->sequence[C->pos[n] + offset + y - C->L])
+            tempscore += C->MATCH;
         else
-            tempscore += MISMATCH;
+            tempscore += C->MISMATCH;
     }
     if (tempscore > ans) ans = tempscore;
 
     /* Case C: multiple gaps in consensus (oldoffset < offset) */
-    for (oldoffset = -MAXOFFSET; oldoffset < offset; oldoffset++) {
+    for (oldoffset = -C->MAXOFFSET; oldoffset < offset; oldoffset++) {
         ismatch = 0;
         for (x = oldoffset; x <= offset; x++) {
-            if (rev[n]) {
-                if (a == compl_base(sequence[pos[n] - (x + y - L - l) - 1]))
+            if (C->rev[n]) {
+                if (a == compl_base(C->sequence[C->pos[n] - (x + y - C->L - C->l) - 1]))
                     ismatch = 1;
             } else {
-                if (a == sequence[pos[n] + x + y - L])
+                if (a == C->sequence[C->pos[n] + x + y - C->L])
                     ismatch = 1;
             }
         }
-        tempscore = score[(y - 1) % 2][n][oldoffset + MAXOFFSET];
-        tempscore += (offset - oldoffset) * GAP;
-        if (ismatch) tempscore += MATCH;
-        else tempscore += MISMATCH;
+        tempscore = C->score[(y - 1) % 2][n][oldoffset + C->MAXOFFSET];
+        tempscore += (offset - oldoffset) * C->GAP;
+        if (ismatch) tempscore += C->MATCH;
+        else tempscore += C->MISMATCH;
         if (tempscore > ans) ans = tempscore;
     }
 
@@ -665,63 +743,63 @@ static int compute_score_right(int y, int n, int offset, char a)
  * (Exact port of RepeatScout lines 1976-2069, with boundary fix)
  * ================================================================ */
 
-static int compute_score_left(int w, int n, int offset, char a)
+static int compute_score_left(DiscoverContext *C, int w, int n, int offset, char a)
 {
     int oldoffset, tempscore, ans, ismatch, x;
-    int bStart, bEnd;
+    gpos_t bStart, bEnd;
 
-    get_boundaries(n, &bStart, &bEnd);
+    get_boundaries(C, n, &bStart, &bEnd);
 
     /* Boundary check (note: directions are swapped vs right) */
-    if (rev[n]) {
-        if (pos[n] - (offset + w - L - l) - 1 >= bEnd)
+    if (C->rev[n]) {
+        if (C->pos[n] - (offset + w - C->L - C->l) - 1 >= bEnd)
             return 0;
     } else {
-        if (pos[n] + offset + w - L < bStart)
+        if (C->pos[n] + offset + w - C->L < bStart)
             return 0;
     }
 
     ans = -1000000000;
 
     /* Case A: gap in sequence (oldoffset = offset-1) */
-    if (offset > -MAXOFFSET) {
+    if (offset > -C->MAXOFFSET) {
         oldoffset = offset - 1;
-        tempscore = score[(w + 1) % 2][n][oldoffset + MAXOFFSET] + GAP;
+        tempscore = C->score[(w + 1) % 2][n][oldoffset + C->MAXOFFSET] + C->GAP;
         if (tempscore > ans) ans = tempscore;
     }
 
     /* Case B: diagonal (oldoffset = offset) */
     oldoffset = offset;
-    tempscore = score[(w + 1) % 2][n][oldoffset + MAXOFFSET];
-    if (rev[n]) {
-        if (a == compl_base(sequence[pos[n] - (offset + w - L - l) - 1]))
-            tempscore += MATCH;
+    tempscore = C->score[(w + 1) % 2][n][oldoffset + C->MAXOFFSET];
+    if (C->rev[n]) {
+        if (a == compl_base(C->sequence[C->pos[n] - (offset + w - C->L - C->l) - 1]))
+            tempscore += C->MATCH;
         else
-            tempscore += MISMATCH;
+            tempscore += C->MISMATCH;
     } else {
-        if (a == sequence[pos[n] + offset + w - L])
-            tempscore += MATCH;
+        if (a == C->sequence[C->pos[n] + offset + w - C->L])
+            tempscore += C->MATCH;
         else
-            tempscore += MISMATCH;
+            tempscore += C->MISMATCH;
     }
     if (tempscore > ans) ans = tempscore;
 
     /* Case C: multiple gaps in consensus (oldoffset > offset) */
-    for (oldoffset = offset + 1; oldoffset <= MAXOFFSET; oldoffset++) {
+    for (oldoffset = offset + 1; oldoffset <= C->MAXOFFSET; oldoffset++) {
         ismatch = 0;
         for (x = offset; x <= oldoffset; x++) {
-            if (rev[n]) {
-                if (a == compl_base(sequence[pos[n] - (x + w - L - l) - 1]))
+            if (C->rev[n]) {
+                if (a == compl_base(C->sequence[C->pos[n] - (x + w - C->L - C->l) - 1]))
                     ismatch = 1;
             } else {
-                if (a == sequence[pos[n] + x + w - L])
+                if (a == C->sequence[C->pos[n] + x + w - C->L])
                     ismatch = 1;
             }
         }
-        tempscore = score[(w + 1) % 2][n][oldoffset + MAXOFFSET];
-        tempscore += (oldoffset - offset) * GAP;
-        if (ismatch) tempscore += MATCH;
-        else tempscore += MISMATCH;
+        tempscore = C->score[(w + 1) % 2][n][oldoffset + C->MAXOFFSET];
+        tempscore += (oldoffset - offset) * C->GAP;
+        if (ismatch) tempscore += C->MATCH;
+        else tempscore += C->MISMATCH;
         if (tempscore > ans) ans = tempscore;
     }
 
@@ -733,48 +811,48 @@ static int compute_score_left(int w, int n, int offset, char a)
  * (Exact port of RepeatScout lines 1722-1776)
  * ================================================================ */
 
-static void compute_totalbestscore_right(int y)
+static void compute_totalbestscore_right(DiscoverContext *C, int y)
 {
     int n, bestscore, offset;
 
-    nrepeatocc = 0;
-    nactiverepeatocc = 0;
-    totalbestscore = 0;
+    C->nrepeatocc = 0;
+    C->nactiverepeatocc = 0;
+    C->totalbestscore = 0;
 
-    for (n = 0; n < N; n++) {
-        bestscore = bestbestscore[n] + CAPPENALTY;
+    for (n = 0; n < C->N; n++) {
+        bestscore = C->bestbestscore[n] + C->CAPPENALTY;
         if (bestscore < 0) bestscore = 0;
 
         int bestscore_offset = -100000;
-        for (offset = -MAXOFFSET; offset <= MAXOFFSET; offset++) {
-            if (score[y % 2][n][offset + MAXOFFSET] > bestscore) {
-                bestscore = score[y % 2][n][offset + MAXOFFSET];
+        for (offset = -C->MAXOFFSET; offset <= C->MAXOFFSET; offset++) {
+            if (C->score[y % 2][n][offset + C->MAXOFFSET] > bestscore) {
+                bestscore = C->score[y % 2][n][offset + C->MAXOFFSET];
                 bestscore_offset = offset;
             }
         }
 
-        if (bestscore > 0) nrepeatocc++;
-        if (bestscore > bestbestscore[n] + CAPPENALTY) nactiverepeatocc++;
-        if (bestscore > bestbestscore[n]) {
-            if (bestscore_offset >= -MAXOFFSET)
-                best_right_offset[n] = bestscore_offset + y;
-            bestbestscore[n] = bestscore;
+        if (bestscore > 0) C->nrepeatocc++;
+        if (bestscore > C->bestbestscore[n] + C->CAPPENALTY) C->nactiverepeatocc++;
+        if (bestscore > C->bestbestscore[n]) {
+            if (bestscore_offset >= -C->MAXOFFSET)
+                C->best_right_offset[n] = bestscore_offset + y;
+            C->bestbestscore[n] = bestscore;
         }
-        totalbestscore += bestscore;
+        C->totalbestscore += bestscore;
     }
 
     /* MINIMPROVEMENT checkpoint */
-    if ((totalbestscore >= besttotalbestscore + (y - besty) * MINIMPROVEMENT)
-        && (totalbestscore > besttotalbestscore)) {
-        besty = y;
-        besttotalbestscore = totalbestscore;
-        bestnrepeatocc = nrepeatocc;
-        bestnactiverepeatocc = nactiverepeatocc;
-        for (n = 0; n < N; n++) {
-            save_right_offset[n] = best_right_offset[n];
-            savebestscore[n] = bestbestscore[n];
-            for (offset = -MAXOFFSET; offset <= MAXOFFSET; offset++)
-                score_of_besty[n][offset + MAXOFFSET] = score[y % 2][n][offset + MAXOFFSET];
+    if ((C->totalbestscore >= C->besttotalbestscore + (y - C->besty) * C->MINIMPROVEMENT)
+        && (C->totalbestscore > C->besttotalbestscore)) {
+        C->besty = y;
+        C->besttotalbestscore = C->totalbestscore;
+        C->bestnrepeatocc = C->nrepeatocc;
+        C->bestnactiverepeatocc = C->nactiverepeatocc;
+        for (n = 0; n < C->N; n++) {
+            C->save_right_offset[n] = C->best_right_offset[n];
+            C->savebestscore[n] = C->bestbestscore[n];
+            for (offset = -C->MAXOFFSET; offset <= C->MAXOFFSET; offset++)
+                C->score_of_besty[n][offset + C->MAXOFFSET] = C->score[y % 2][n][offset + C->MAXOFFSET];
         }
     }
 }
@@ -788,45 +866,45 @@ static void compute_totalbestscore_right(int y)
  * This is intentional — see plan review #1.
  * ================================================================ */
 
-static void compute_totalbestscore_left(int w)
+static void compute_totalbestscore_left(DiscoverContext *C, int w)
 {
     int n, bestscore, offset;
 
-    nrepeatocc = 0;
-    nactiverepeatocc = 0;
-    totalbestscore = 0;
+    C->nrepeatocc = 0;
+    C->nactiverepeatocc = 0;
+    C->totalbestscore = 0;
 
-    for (n = 0; n < N; n++) {
+    for (n = 0; n < C->N; n++) {
         int bestscore_offset = -100000;
-        bestscore = bestbestscore[n] + CAPPENALTY;
+        bestscore = C->bestbestscore[n] + C->CAPPENALTY;
         if (bestscore < 0) bestscore = 0;
 
-        for (offset = -MAXOFFSET; offset <= MAXOFFSET; offset++) {
-            if (score[w % 2][n][offset + MAXOFFSET] > bestscore) {
-                bestscore = score[w % 2][n][offset + MAXOFFSET];
+        for (offset = -C->MAXOFFSET; offset <= C->MAXOFFSET; offset++) {
+            if (C->score[w % 2][n][offset + C->MAXOFFSET] > bestscore) {
+                bestscore = C->score[w % 2][n][offset + C->MAXOFFSET];
                 bestscore_offset = offset;
             }
         }
 
-        if (bestscore > 0) nrepeatocc++;
-        if (bestscore > bestbestscore[n] + CAPPENALTY) nactiverepeatocc++;
-        if (bestscore > bestbestscore[n]) {
-            if (bestscore_offset >= -MAXOFFSET)
-                best_left_offset[n] = bestscore_offset + w;
-            bestbestscore[n] = bestscore;
+        if (bestscore > 0) C->nrepeatocc++;
+        if (bestscore > C->bestbestscore[n] + C->CAPPENALTY) C->nactiverepeatocc++;
+        if (bestscore > C->bestbestscore[n]) {
+            if (bestscore_offset >= -C->MAXOFFSET)
+                C->best_left_offset[n] = bestscore_offset + w;
+            C->bestbestscore[n] = bestscore;
         }
-        totalbestscore += bestscore;
+        C->totalbestscore += bestscore;
     }
 
     /* MINIMPROVEMENT checkpoint — only save offsets, NOT scores/score_of_besty */
-    if ((totalbestscore >= besttotalbestscore + (bestw - w) * MINIMPROVEMENT)
-        && (totalbestscore > besttotalbestscore)) {
-        bestw = w;
-        besttotalbestscore = totalbestscore;
-        bestnrepeatocc = nrepeatocc;
-        bestnactiverepeatocc = nactiverepeatocc;
-        for (n = 0; n < N; n++)
-            save_left_offset[n] = best_left_offset[n];
+    if ((C->totalbestscore >= C->besttotalbestscore + (C->bestw - w) * C->MINIMPROVEMENT)
+        && (C->totalbestscore > C->besttotalbestscore)) {
+        C->bestw = w;
+        C->besttotalbestscore = C->totalbestscore;
+        C->bestnrepeatocc = C->nrepeatocc;
+        C->bestnactiverepeatocc = C->nactiverepeatocc;
+        for (n = 0; n < C->N; n++)
+            C->save_left_offset[n] = C->best_left_offset[n];
     }
 }
 
@@ -835,7 +913,7 @@ static void compute_totalbestscore_left(int w)
  * (Exact port of RepeatScout lines 1034-1117)
  * ================================================================ */
 
-static void extend_right(void)
+static void extend_right(DiscoverContext *C)
 {
     int y, n, bestscore, tempscore, offset;
     char a, besta;
@@ -843,37 +921,37 @@ static void extend_right(void)
     besta = 0;
 
     /* Initialize score at seed's last base */
-    y = L + l - 1;
-    for (n = 0; n < N; n++) {
-        for (offset = -MAXOFFSET; offset <= MAXOFFSET; offset++) {
-            score[y % 2][n][offset + MAXOFFSET] = l * MATCH;
+    y = C->L + C->l - 1;
+    for (n = 0; n < C->N; n++) {
+        for (offset = -C->MAXOFFSET; offset <= C->MAXOFFSET; offset++) {
+            C->score[y % 2][n][offset + C->MAXOFFSET] = C->l * C->MATCH;
             if (offset < 0)
-                score[y % 2][n][offset + MAXOFFSET] += -offset * GAP;
+                C->score[y % 2][n][offset + C->MAXOFFSET] += -offset * C->GAP;
             if (offset > 0)
-                score[y % 2][n][offset + MAXOFFSET] += offset * GAP;
+                C->score[y % 2][n][offset + C->MAXOFFSET] += offset * C->GAP;
         }
-        bestbestscore[n] = l * MATCH;
+        C->bestbestscore[n] = C->l * C->MATCH;
     }
 
     /* Initialize checkpoint */
-    besty = L + l - 1;
-    for (n = 0; n < N; n++) {
-        for (offset = -MAXOFFSET; offset <= MAXOFFSET; offset++)
-            score_of_besty[n][offset + MAXOFFSET] = score[y % 2][n][offset + MAXOFFSET];
+    C->besty = C->L + C->l - 1;
+    for (n = 0; n < C->N; n++) {
+        for (offset = -C->MAXOFFSET; offset <= C->MAXOFFSET; offset++)
+            C->score_of_besty[n][offset + C->MAXOFFSET] = C->score[y % 2][n][offset + C->MAXOFFSET];
     }
-    besttotalbestscore = 0;
-    compute_totalbestscore_right(y);
+    C->besttotalbestscore = 0;
+    compute_totalbestscore_right(C, y);
 
     /* Extend right, one base at a time */
-    for (y = L + l; y < 2 * L + l; y++) {
+    for (y = C->L + C->l; y < 2 * C->L + C->l; y++) {
         newtotalbestscore = 0;
         for (a = 0; a < 4; a++) {
             newtotalbestscore_a = 0;
-            for (n = 0; n < N; n++) {
-                bestscore = bestbestscore[n] + CAPPENALTY;
+            for (n = 0; n < C->N; n++) {
+                bestscore = C->bestbestscore[n] + C->CAPPENALTY;
                 if (bestscore < 0) bestscore = 0;
-                for (offset = -MAXOFFSET; offset <= MAXOFFSET; offset++) {
-                    tempscore = compute_score_right(y, n, offset, a);
+                for (offset = -C->MAXOFFSET; offset <= C->MAXOFFSET; offset++) {
+                    tempscore = compute_score_right(C, y, n, offset, a);
                     if (tempscore > bestscore)
                         bestscore = tempscore;
                 }
@@ -885,23 +963,32 @@ static void extend_right(void)
             }
         }
 
-        master[y] = besta;
-        for (n = 0; n < N; n++) {
-            for (offset = -MAXOFFSET; offset <= MAXOFFSET; offset++)
-                score[y % 2][n][offset + MAXOFFSET] = compute_score_right(y, n, offset, besta);
+        C->master[y] = besta;
+        for (n = 0; n < C->N; n++) {
+            for (offset = -C->MAXOFFSET; offset <= C->MAXOFFSET; offset++)
+                C->score[y % 2][n][offset + C->MAXOFFSET] = compute_score_right(C, y, n, offset, besta);
         }
-        compute_totalbestscore_right(y);
+        compute_totalbestscore_right(C, y);
 
-        if (y - besty >= WHEN_TO_STOP) break;
+        /* Adaptive stop (思路 4): give long consensi a longer quiet
+         * window proportional to extension already achieved.  Without
+         * this, long elements with internal "信息低谷" (low-info
+         * 100-300 bp stretches) trigger early stop even though the
+         * extension has already produced a meaningful long consensus. */
+        int extended_so_far = C->besty - (C->L + C->l - 1);
+        int adaptive_when_to_stop = C->WHEN_TO_STOP;
+        if (extended_so_far / 10 > adaptive_when_to_stop)
+            adaptive_when_to_stop = extended_so_far / 10;
+        if (y - C->besty >= adaptive_when_to_stop) break;
     }
 
-    if (y == 2 * L + l && VERBOSE)
+    if (y == 2 * C->L + C->l && C->VERBOSE)
         fprintf(stderr, "Warning: extended right all the way to %d\n", y);
 
-    y = besty;
-    totalbestscore = besttotalbestscore;
-    nrepeatocc = bestnrepeatocc;
-    nactiverepeatocc = bestnactiverepeatocc;
+    y = C->besty;
+    C->totalbestscore = C->besttotalbestscore;
+    C->nrepeatocc = C->bestnrepeatocc;
+    C->nactiverepeatocc = C->bestnactiverepeatocc;
 }
 
 /* ================================================================
@@ -909,7 +996,7 @@ static void extend_right(void)
  * (Exact port of RepeatScout lines 1119-1205)
  * ================================================================ */
 
-static void extend_left(void)
+static void extend_left(DiscoverContext *C)
 {
     int w, n, bestscore, tempscore, offset;
     char a, besta;
@@ -917,37 +1004,37 @@ static void extend_left(void)
     besta = 0;
 
     /* Initialize from right extension checkpoint */
-    w = L;
-    for (n = 0; n < N; n++) {
-        bestscore = savebestscore[n] + CAPPENALTY;
-        for (offset = -MAXOFFSET; offset <= MAXOFFSET; offset++) {
-            if (score_of_besty[n][offset + MAXOFFSET] > bestscore)
-                bestscore = score_of_besty[n][offset + MAXOFFSET];
+    w = C->L;
+    for (n = 0; n < C->N; n++) {
+        bestscore = C->savebestscore[n] + C->CAPPENALTY;
+        for (offset = -C->MAXOFFSET; offset <= C->MAXOFFSET; offset++) {
+            if (C->score_of_besty[n][offset + C->MAXOFFSET] > bestscore)
+                bestscore = C->score_of_besty[n][offset + C->MAXOFFSET];
         }
-        for (offset = -MAXOFFSET; offset <= MAXOFFSET; offset++) {
-            score[w % 2][n][offset + MAXOFFSET] = bestscore;
+        for (offset = -C->MAXOFFSET; offset <= C->MAXOFFSET; offset++) {
+            C->score[w % 2][n][offset + C->MAXOFFSET] = bestscore;
             if (offset < 0)
-                score[w % 2][n][offset + MAXOFFSET] += -offset * GAP;
+                C->score[w % 2][n][offset + C->MAXOFFSET] += -offset * C->GAP;
             if (offset > 0)
-                score[w % 2][n][offset + MAXOFFSET] += offset * GAP;
+                C->score[w % 2][n][offset + C->MAXOFFSET] += offset * C->GAP;
         }
-        bestbestscore[n] = bestscore;
+        C->bestbestscore[n] = bestscore;
     }
 
     /* Initialize checkpoint */
-    bestw = L;
-    compute_totalbestscore_left(w);
+    C->bestw = C->L;
+    compute_totalbestscore_left(C, w);
 
     /* Extend left */
-    for (w = L - 1; w >= 0; w--) {
+    for (w = C->L - 1; w >= 0; w--) {
         newtotalbestscore = 0;
         for (a = 0; a < 4; a++) {
             newtotalbestscore_a = 0;
-            for (n = 0; n < N; n++) {
-                bestscore = bestbestscore[n] + CAPPENALTY;
+            for (n = 0; n < C->N; n++) {
+                bestscore = C->bestbestscore[n] + C->CAPPENALTY;
                 if (bestscore < 0) bestscore = 0;
-                for (offset = -MAXOFFSET; offset <= MAXOFFSET; offset++) {
-                    tempscore = compute_score_left(w, n, offset, a);
+                for (offset = -C->MAXOFFSET; offset <= C->MAXOFFSET; offset++) {
+                    tempscore = compute_score_left(C, w, n, offset, a);
                     if (tempscore > bestscore)
                         bestscore = tempscore;
                 }
@@ -959,514 +1046,161 @@ static void extend_left(void)
             }
         }
 
-        master[w] = besta;
-        for (n = 0; n < N; n++) {
-            for (offset = -MAXOFFSET; offset <= MAXOFFSET; offset++)
-                score[w % 2][n][offset + MAXOFFSET] = compute_score_left(w, n, offset, besta);
+        C->master[w] = besta;
+        for (n = 0; n < C->N; n++) {
+            for (offset = -C->MAXOFFSET; offset <= C->MAXOFFSET; offset++)
+                C->score[w % 2][n][offset + C->MAXOFFSET] = compute_score_left(C, w, n, offset, besta);
         }
-        compute_totalbestscore_left(w);
+        compute_totalbestscore_left(C, w);
 
-        if (w - bestw <= -WHEN_TO_STOP) break;
+        /* Adaptive stop (思路 4): mirror of extend_right. */
+        int extended_left_so_far = C->L - C->bestw;
+        int adaptive_when_to_stop_l = C->WHEN_TO_STOP;
+        if (extended_left_so_far / 10 > adaptive_when_to_stop_l)
+            adaptive_when_to_stop_l = extended_left_so_far / 10;
+        if (w - C->bestw <= -adaptive_when_to_stop_l) break;
     }
 
-    if (w == -1 && VERBOSE)
+    if (w == -1 && C->VERBOSE)
         fprintf(stderr, "Warning: extended left all the way to %d\n", w);
 
-    w = bestw;
-    totalbestscore = besttotalbestscore;
-    nrepeatocc = bestnrepeatocc;
-    nactiverepeatocc = bestnactiverepeatocc;
+    w = C->bestw;
+    C->totalbestscore = C->besttotalbestscore;
+    C->nrepeatocc = C->bestnrepeatocc;
+    C->nactiverepeatocc = C->bestnactiverepeatocc;
 
-    masterstart[R] = bestw;
-    masterend[R] = besty;
-    for (w = bestw; w <= besty; w++)
-        masters[R][w] = master[w];
+    C->masterstart[C->R] = C->bestw;
+    C->masterend[C->R] = C->besty;
+    for (w = C->bestw; w <= C->besty; w++)
+        C->masters[C->R][w] = C->master[w];
 }
 
 /* ================================================================
- * Mask scoring: compute_maskscore_right
- * (Exact port of RepeatScout lines 2071-2113)
+ * Masking subsystem moved to discover_mask.c (M3#8 split).
+ * mask_headptr() is the single public entry; see discover_internal.h.
  * ================================================================ */
 
-static int compute_maskscore_right(char mbase, int repeaty, int seqpos, int offset)
-{
-    int oldoffset, tempscore, ans, ismatch, x;
-
-    ans = -1000000000;
-
-    /* Case A: gap in sequence */
-    if (offset < MAXOFFSET) {
-        oldoffset = offset + 1;
-        tempscore = maskscore[(repeaty + 1) % 2][oldoffset + MAXOFFSET] + GAP;
-        if (tempscore > ans) ans = tempscore;
-    }
-
-    /* Case B: diagonal */
-    oldoffset = offset;
-    tempscore = maskscore[(repeaty + 1) % 2][oldoffset + MAXOFFSET];
-    if (mbase == sequence[seqpos + l + repeaty + offset])
-        tempscore += MATCH;
-    else
-        tempscore += MISMATCH;
-    if (tempscore > ans) ans = tempscore;
-
-    /* Case C: multiple gaps */
-    for (oldoffset = -MAXOFFSET; oldoffset < offset; oldoffset++) {
-        ismatch = 0;
-        for (x = oldoffset; x <= offset; x++) {
-            if (mbase == sequence[seqpos + l + repeaty + x])
-                ismatch = 1;
-        }
-        tempscore = maskscore[(repeaty + 1) % 2][oldoffset + MAXOFFSET];
-        tempscore += (offset - oldoffset) * GAP;
-        if (ismatch) tempscore += MATCH;
-        else tempscore += MISMATCH;
-        if (tempscore > ans) ans = tempscore;
-    }
-
-    return ans;
-}
-
-/* ================================================================
- * Mask scoring: compute_maskscore_left
- * (Exact port of RepeatScout lines 2116-2161)
- * ================================================================ */
-
-static int compute_maskscore_left(char mbase, int repeatw, int seqpos, int offset)
-{
-    int oldoffset, tempscore, ans, ismatch, x;
-
-    ans = -1000000000;
-
-    /* Case A: gap in sequence */
-    if (offset > -MAXOFFSET) {
-        oldoffset = offset - 1;
-        tempscore = maskscore[(repeatw + 1) % 2][oldoffset + MAXOFFSET] + GAP;
-        if (tempscore > ans) ans = tempscore;
-    }
-
-    /* Case B: diagonal */
-    oldoffset = offset;
-    tempscore = maskscore[(repeatw + 1) % 2][oldoffset + MAXOFFSET];
-    if (mbase == sequence[seqpos - repeatw - 1 + offset])
-        tempscore += MATCH;
-    else
-        tempscore += MISMATCH;
-    if (tempscore > ans) ans = tempscore;
-
-    /* Case C: multiple gaps */
-    for (oldoffset = offset + 1; oldoffset <= MAXOFFSET; oldoffset++) {
-        ismatch = 0;
-        for (x = offset; x <= oldoffset; x++) {
-            if (mbase == sequence[seqpos - repeatw - 1 + x])
-                ismatch = 1;
-        }
-        tempscore = maskscore[(repeatw + 1) % 2][oldoffset + MAXOFFSET];
-        tempscore += (oldoffset - offset) * GAP;
-        if (ismatch) tempscore += MATCH;
-        else tempscore += MISMATCH;
-        if (tempscore > ans) ans = tempscore;
-    }
-
-    return ans;
-}
-
-/* ================================================================
- * maskextend_right
- * (Exact port of RepeatScout lines 1387-1472)
- * ================================================================ */
-
-static int maskextend_right(int rc, int seqpos, int modelpos)
-{
-    int offset, bestmaskscore_val, bestbestmaskscore, bestoffset, bestbestoffset;
-    int bEnd, x, bestx, maxext;
-    char mbase;
-
-    /* Initialize maskscore */
-    for (offset = -MAXOFFSET; offset <= MAXOFFSET; offset++) {
-        maskscore[1][offset + MAXOFFSET] = 0;
-        if (offset < 0) maskscore[1][offset + MAXOFFSET] += -offset * GAP;
-        if (offset > 0) maskscore[1][offset + MAXOFFSET] += offset * GAP;
-    }
-
-    bestbestmaskscore = 0;
-    bestbestoffset = 0;
-    bestoffset = 0;
-    bestx = 0;
-
-    /* Find sequence boundary */
-    bEnd = 0;
-    x = 0;
-    while (disc_boundaries[x] > 0) {
-        if (seqpos < disc_boundaries[x] + PADLENGTH) {
-            bEnd = disc_boundaries[x] + PADLENGTH;
-            break;
-        }
-        x++;
-    }
-
-    /* Max extension distance in model */
-    maxext = masterend[R - 1] - (modelpos + l + 1);
-    if (rc)
-        maxext = modelpos - (masterstart[R - 1] + 1);
-
-    for (x = 0; x < maxext; x++) {
-        if (bEnd > 0 && seqpos + l + x == bEnd)
-            break;
-
-        /* Get consensus base (4 combinations of direction × strand) */
-        if (rc)
-            mbase = compl_base(masters[R - 1][modelpos - x - 1]);
-        else
-            mbase = masters[R - 1][modelpos + l + x];
-
-        bestmaskscore_val = -1000000000;
-        for (offset = -MAXOFFSET; offset <= MAXOFFSET; offset++) {
-            if (bEnd > 0 && seqpos + l + x + offset >= bEnd) {
-                maskscore[(x + 2) % 2][offset + MAXOFFSET] = 0;
-            } else {
-                maskscore[(x + 2) % 2][offset + MAXOFFSET] =
-                    compute_maskscore_right(mbase, x, seqpos, offset);
-            }
-            if (maskscore[(x + 2) % 2][offset + MAXOFFSET] > bestmaskscore_val) {
-                bestmaskscore_val = maskscore[(x + 2) % 2][offset + MAXOFFSET];
-                bestoffset = offset;
-            }
-        }
-        if (bestmaskscore_val > bestbestmaskscore) {
-            bestbestmaskscore = bestmaskscore_val;
-            bestbestoffset = bestoffset;
-            bestx = x;
-        }
-        if (x - bestx >= WHEN_TO_STOP) break;
-    }
-
-    return seqpos + l + bestx + bestbestoffset;
-}
-
-/* ================================================================
- * maskextend_left
- * (Exact port of RepeatScout lines 1496-1578)
- * ================================================================ */
-
-static int maskextend_left(int rc, int seqpos, int modelpos)
-{
-    int offset, bestmaskscore_val, bestbestmaskscore, bestoffset, bestbestoffset;
-    int maxext, bStart, x, bestx;
-    char mbase;
-
-    /* Initialize maskscore */
-    for (offset = -MAXOFFSET; offset <= MAXOFFSET; offset++) {
-        maskscore[1][offset + MAXOFFSET] = 0;
-        if (offset < 0) maskscore[1][offset + MAXOFFSET] += -offset * GAP;
-        if (offset > 0) maskscore[1][offset + MAXOFFSET] += offset * GAP;
-    }
-
-    bestbestoffset = 0;
-    bestoffset = 0;
-    bestbestmaskscore = 0;
-    bestx = 0;
-
-    /* Find sequence boundary */
-    bStart = 0;
-    x = 0;
-    while (disc_boundaries[x] > 0) {
-        if (seqpos < disc_boundaries[x] + PADLENGTH) {
-            if (x > 0)
-                bStart = disc_boundaries[x - 1] + PADLENGTH;
-            break;
-        }
-        x++;
-    }
-
-    /* Max extension distance in model */
-    maxext = modelpos - masterstart[R - 1];
-    if (rc)
-        maxext = masterend[R - 1] - (modelpos + l - 1);
-
-    for (x = 0; x < maxext; x++) {
-        if (seqpos - x - 1 == bStart)
-            break;
-
-        /* Get consensus base */
-        if (rc)
-            mbase = compl_base(masters[R - 1][modelpos + l + x]);
-        else
-            mbase = masters[R - 1][modelpos - x - 1];
-
-        bestmaskscore_val = -1000000000;
-        for (offset = -MAXOFFSET; offset <= MAXOFFSET; offset++) {
-            if (seqpos - x - 1 + offset < bStart) {
-                maskscore[(x + 2) % 2][offset + MAXOFFSET] = 0;
-            } else {
-                maskscore[(x + 2) % 2][offset + MAXOFFSET] =
-                    compute_maskscore_left(mbase, x, seqpos, offset);
-            }
-            if (maskscore[(x + 2) % 2][offset + MAXOFFSET] > bestmaskscore_val) {
-                bestmaskscore_val = maskscore[(x + 2) % 2][offset + MAXOFFSET];
-                bestoffset = offset;
-            }
-        }
-        if (bestmaskscore_val > bestbestmaskscore) {
-            bestbestmaskscore = bestmaskscore_val;
-            bestbestoffset = bestoffset;
-            bestx = x;
-        }
-        if (x - bestx >= WHEN_TO_STOP) break;
-    }
-
-    return seqpos - bestx + bestbestoffset - 1;
-}
-
-/* ================================================================
- * mask_headptr: mask found family from genome
- * (Exact port of RepeatScout lines 1207-1364, with dynamic value[])
- * ================================================================ */
-
-static void mask_headptr(struct llist **headptr)
-{
-    int x, y, smallh, h, h2;
-    int startmask, endmask;
-    int bestsequencey_val, bestsequencew_val;
-    struct repeatllist **repeatheadptr;
-    struct repeatllist *repeattmp, *nextrepeattmp;
-    struct llist *tmp, *tmp2;
-    struct posllist *postmp;
-    int rrev;
-
-    /* Build small hash table of l-mers from consensus */
-    repeatheadptr = malloc(SMALLHASH_SIZE * sizeof(*repeatheadptr));
-    if (repeatheadptr == NULL) {
-        fprintf(stderr, "discover: out of memory for repeatheadptr\n"); exit(1);
-    }
-    for (smallh = 0; smallh < SMALLHASH_SIZE; smallh++)
-        repeatheadptr[smallh] = NULL;
-
-    for (x = masterstart[R - 1]; x <= masterend[R - 1] - l + 1; x++) {
-        smallh = smallhash_function(masters[R - 1] + x);
-        if (smallh < 0) continue;
-
-        /* Check if already present */
-        repeattmp = repeatheadptr[smallh];
-        while (repeattmp != NULL) {
-            if (lmermatch(repeattmp->value, masters[R - 1] + x))
-                break;
-            repeattmp = repeattmp->next;
-        }
-        if (repeattmp != NULL) continue;
-
-        /* Add new entry (FIXED: dynamic value allocation) */
-        repeattmp = malloc(sizeof(*repeattmp));
-        if (repeattmp == NULL) {
-            fprintf(stderr, "discover: out of memory\n"); exit(1);
-        }
-        repeattmp->value = malloc(l * sizeof(char));
-        if (repeattmp->value == NULL) {
-            fprintf(stderr, "discover: out of memory for value\n"); exit(1);
-        }
-        for (y = 0; y < l; y++)
-            repeattmp->value[y] = masters[R - 1][x + y];
-        repeattmp->repeatpos = x;
-        repeattmp->next = repeatheadptr[smallh];
-        repeatheadptr[smallh] = repeattmp;
-    }
-
-    /* Find and extend hits */
-    for (smallh = 0; smallh < SMALLHASH_SIZE; smallh++) {
-        repeattmp = repeatheadptr[smallh];
-        while (repeattmp != NULL) {
-            /* Find matching entry in main headptr */
-            h = hash_function(repeattmp->value);
-            tmp = headptr[h];
-            while (tmp != NULL) {
-                if (lmermatch(sequence + tmp->lastocc, repeattmp->value))
-                    break;
-                else if (lmermatchrc(sequence + tmp->lastocc, repeattmp->value))
-                    break;
-                tmp = tmp->next;
-            }
-            if (tmp == NULL) { repeattmp = repeattmp->next; continue; }
-
-            /* Extend each unmasked hit */
-            postmp = tmp->pos;
-            while (postmp != NULL) {
-                x = postmp->this;
-                if (removed[x] == 1) { postmp = postmp->next; continue; }
-
-                /* Strand determination */
-                rrev = 1;
-                if (lmermatch(sequence + x, repeattmp->value))
-                    rrev = 0;
-
-                /* 1-vs-1 banded DP extension */
-                bestsequencey_val = maskextend_right(rrev, x, repeattmp->repeatpos);
-                bestsequencew_val = maskextend_left(rrev, x, repeattmp->repeatpos);
-
-                /* Determine mask range */
-                if (EXTRAMASK) {
-                    startmask = bestsequencew_val - l + 1;
-                    if (startmask < 0) startmask = 0;
-                    endmask = bestsequencey_val;
-                } else {
-                    startmask = bestsequencew_val;
-                    endmask = bestsequencey_val - l + 1;
-                }
-
-                /* Mask and update frequencies */
-                for (y = startmask; y <= endmask; y++) {
-                    if (removed[y] == 1) continue;
-                    h2 = hash_function(sequence + y);
-                    if (h2 < 0) continue;
-                    tmp2 = headptr[h2];
-                    while (tmp2 != NULL) {
-                        if (lmermatcheither(sequence + tmp2->lastocc, sequence + y)) {
-                            tmp2->freq -= 1;
-                            break;
-                        }
-                        tmp2 = tmp2->next;
-                    }
-                    removed[y] = 1;
-                }
-
-                postmp = postmp->next;
-            }
-            repeattmp = repeattmp->next;
-        }
-    }
-
-    /* Free repeatheadptr */
-    for (smallh = 0; smallh < SMALLHASH_SIZE; smallh++) {
-        repeattmp = repeatheadptr[smallh];
-        while (repeattmp != NULL) {
-            nextrepeattmp = repeattmp->next;
-            free(repeattmp->value);
-            free(repeattmp);
-            repeattmp = nextrepeattmp;
-        }
-    }
-    free(repeatheadptr);
-}
 
 /* ================================================================
  * Workspace allocation and deallocation
  * ================================================================ */
 
-static int allocate_workspace(void)
+static int allocate_workspace(DiscoverContext *C)
 {
     int x, n;
 
-    master = malloc((2 * L + l + 1) * sizeof(char));
-    if (!master) return -1;
-    master[2 * L + l] = '\0';
+    C->master = malloc((2 * C->L + C->l + 1) * sizeof(char));
+    if (!C->master) return -1;
+    C->master[2 * C->L + C->l] = '\0';
 
-    masters_allocated = calloc(MAXR, sizeof(int));
-    masterstart = malloc(MAXR * sizeof(int));
-    masterend = malloc(MAXR * sizeof(int));
-    if (!masters_allocated || !masterstart || !masterend) return -1;
+    C->masters_allocated = calloc(C->MAXR, sizeof(int));
+    C->masterstart = malloc(C->MAXR * sizeof(int));
+    C->masterend = malloc(C->MAXR * sizeof(int));
+    if (!C->masters_allocated || !C->masterstart || !C->masterend) return -1;
 
-    masters = malloc(MAXR * sizeof(*masters));
-    if (!masters) return -1;
+    C->masters = malloc(C->MAXR * sizeof(*C->masters));
+    if (!C->masters) return -1;
 
-    rev = malloc(MAXN * sizeof(char));
-    upperBoundI = malloc(MAXN * sizeof(int));
-    pos = malloc(MAXN * sizeof(int));
-    bestbestscore = malloc(MAXN * sizeof(int));
-    savebestscore = malloc(MAXN * sizeof(int));
-    best_left_offset = malloc(MAXN * sizeof(int));
-    save_left_offset = malloc(MAXN * sizeof(int));
-    best_right_offset = malloc(MAXN * sizeof(int));
-    save_right_offset = malloc(MAXN * sizeof(int));
-    if (!rev || !upperBoundI || !pos || !bestbestscore || !savebestscore ||
-        !best_left_offset || !save_left_offset ||
-        !best_right_offset || !save_right_offset) return -1;
+    C->rev = malloc(C->MAXN * sizeof(char));
+    C->upperBoundI = malloc(C->MAXN * sizeof(int));
+    C->pos = malloc(C->MAXN * sizeof(*C->pos));
+    C->bestbestscore = malloc(C->MAXN * sizeof(int));
+    C->savebestscore = malloc(C->MAXN * sizeof(int));
+    C->best_left_offset = malloc(C->MAXN * sizeof(int));
+    C->save_left_offset = malloc(C->MAXN * sizeof(int));
+    C->best_right_offset = malloc(C->MAXN * sizeof(int));
+    C->save_right_offset = malloc(C->MAXN * sizeof(int));
+    if (!C->rev || !C->upperBoundI || !C->pos || !C->bestbestscore || !C->savebestscore ||
+        !C->best_left_offset || !C->save_left_offset ||
+        !C->best_right_offset || !C->save_right_offset) return -1;
 
     /* score[2][MAXN][2*MAXOFFSET+1] */
-    score = malloc(2 * sizeof(*score));
-    if (!score) return -1;
+    C->score = malloc(2 * sizeof(*C->score));
+    if (!C->score) return -1;
     for (x = 0; x < 2; x++) {
-        score[x] = malloc(MAXN * sizeof(*score[x]));
-        if (!score[x]) return -1;
-        for (n = 0; n < MAXN; n++) {
-            score[x][n] = malloc((2 * MAXOFFSET + 1) * sizeof(*score[x][n]));
-            if (!score[x][n]) return -1;
+        C->score[x] = malloc(C->MAXN * sizeof(*C->score[x]));
+        if (!C->score[x]) return -1;
+        for (n = 0; n < C->MAXN; n++) {
+            C->score[x][n] = malloc((2 * C->MAXOFFSET + 1) * sizeof(*C->score[x][n]));
+            if (!C->score[x][n]) return -1;
         }
     }
 
     /* score_of_besty[MAXN][2*MAXOFFSET+1] */
-    score_of_besty = malloc(MAXN * sizeof(*score_of_besty));
-    if (!score_of_besty) return -1;
-    for (n = 0; n < MAXN; n++) {
-        score_of_besty[n] = malloc((2 * MAXOFFSET + 1) * sizeof(*score_of_besty[n]));
-        if (!score_of_besty[n]) return -1;
+    C->score_of_besty = malloc(C->MAXN * sizeof(*C->score_of_besty));
+    if (!C->score_of_besty) return -1;
+    for (n = 0; n < C->MAXN; n++) {
+        C->score_of_besty[n] = malloc((2 * C->MAXOFFSET + 1) * sizeof(*C->score_of_besty[n]));
+        if (!C->score_of_besty[n]) return -1;
     }
 
     /* maskscore[2][2*MAXOFFSET+1] */
-    maskscore = malloc(2 * sizeof(*maskscore));
-    if (!maskscore) return -1;
+    C->maskscore = malloc(2 * sizeof(*C->maskscore));
+    if (!C->maskscore) return -1;
     for (x = 0; x < 2; x++) {
-        maskscore[x] = malloc((2 * MAXOFFSET + 1) * sizeof(*maskscore[x]));
-        if (!maskscore[x]) return -1;
+        C->maskscore[x] = malloc((2 * C->MAXOFFSET + 1) * sizeof(*C->maskscore[x]));
+        if (!C->maskscore[x]) return -1;
     }
 
     return 0;
 }
 
-static void free_workspace(void)
+static void free_workspace(DiscoverContext *C)
 {
     int x, n;
 
-    free(master); master = NULL;
-    if (masters) {
-        for (int r = 0; r < MAXR; r++) {
-            if (masters_allocated && masters_allocated[r])
-                free(masters[r]);
+    free(C->master); C->master = NULL;
+    if (C->masters) {
+        for (int r = 0; r < C->MAXR; r++) {
+            if (C->masters_allocated && C->masters_allocated[r])
+                free(C->masters[r]);
         }
-        free(masters); masters = NULL;
+        free(C->masters); C->masters = NULL;
     }
-    free(masters_allocated); masters_allocated = NULL;
-    free(masterstart); masterstart = NULL;
-    free(masterend); masterend = NULL;
+    free(C->masters_allocated); C->masters_allocated = NULL;
+    free(C->masterstart); C->masterstart = NULL;
+    free(C->masterend); C->masterend = NULL;
 
-    free(rev); rev = NULL;
-    free(upperBoundI); upperBoundI = NULL;
-    free(pos); pos = NULL;
-    free(bestbestscore); bestbestscore = NULL;
-    free(savebestscore); savebestscore = NULL;
-    free(best_left_offset); best_left_offset = NULL;
-    free(save_left_offset); save_left_offset = NULL;
-    free(best_right_offset); best_right_offset = NULL;
-    free(save_right_offset); save_right_offset = NULL;
+    free(C->rev); C->rev = NULL;
+    free(C->upperBoundI); C->upperBoundI = NULL;
+    free(C->pos); C->pos = NULL;
+    free(C->bestbestscore); C->bestbestscore = NULL;
+    free(C->savebestscore); C->savebestscore = NULL;
+    free(C->best_left_offset); C->best_left_offset = NULL;
+    free(C->save_left_offset); C->save_left_offset = NULL;
+    free(C->best_right_offset); C->best_right_offset = NULL;
+    free(C->save_right_offset); C->save_right_offset = NULL;
 
-    if (score) {
+    if (C->score) {
         for (x = 0; x < 2; x++) {
-            if (score[x]) {
-                for (n = 0; n < MAXN; n++)
-                    free(score[x][n]);
-                free(score[x]);
+            if (C->score[x]) {
+                for (n = 0; n < C->MAXN; n++)
+                    free(C->score[x][n]);
+                free(C->score[x]);
             }
         }
-        free(score); score = NULL;
+        free(C->score); C->score = NULL;
     }
 
-    if (score_of_besty) {
-        for (n = 0; n < MAXN; n++)
-            free(score_of_besty[n]);
-        free(score_of_besty); score_of_besty = NULL;
+    if (C->score_of_besty) {
+        for (n = 0; n < C->MAXN; n++)
+            free(C->score_of_besty[n]);
+        free(C->score_of_besty); C->score_of_besty = NULL;
     }
 
-    if (maskscore) {
+    if (C->maskscore) {
         for (x = 0; x < 2; x++)
-            free(maskscore[x]);
-        free(maskscore); maskscore = NULL;
+            free(C->maskscore[x]);
+        free(C->maskscore); C->maskscore = NULL;
     }
 
-    free(removed); removed = NULL;
-    free(disc_boundaries); disc_boundaries = NULL;
-    free(sequence_owned); sequence_owned = NULL;
-    sequence = NULL;
+    free(C->removed); C->removed = NULL;
+    free(C->disc_boundaries); C->disc_boundaries = NULL;
+    free(C->sequence_owned); C->sequence_owned = NULL;
+    C->sequence = NULL;
 }
 
-static void free_headptr(struct llist **headptr)
+static void free_headptr(struct llist **headptr, gpos_t hash_size)
 {
     int h;
     struct llist *tmp, *nexttmp;
@@ -1474,7 +1208,7 @@ static void free_headptr(struct llist **headptr)
 
     if (!headptr) return;
 
-    for (h = 0; h < HASH_SIZE; h++) {
+    for (h = 0; h < hash_size; h++) {
         tmp = headptr[h];
         while (tmp != NULL) {
             nexttmp = tmp->next;
@@ -1500,36 +1234,36 @@ static void free_headptr(struct llist **headptr)
  * approximate instance locations and edit counts.
  * ================================================================ */
 
-static void collect_instances_from_extension(CandidateFamily *fam)
+static void collect_instances_from_extension(DiscoverContext *C, CandidateFamily *fam)
 {
-    int cons_len = masterend[R] - masterstart[R] + 1;
+    int cons_len = C->masterend[C->R] - C->masterstart[C->R] + 1;
     int n, i;
 
-    fam->instances = malloc(N * sizeof(Instance));
+    fam->instances = malloc(C->N * sizeof(Instance));
     if (!fam->instances) {
         fprintf(stderr, "discover: out of memory for instances\n");
         fam->num_instances = 0;
         fam->cap_instances = 0;
         return;
     }
-    fam->cap_instances = N;
+    fam->cap_instances = C->N;
     fam->num_instances = 0;
 
-    for (n = 0; n < N; n++) {
+    for (n = 0; n < C->N; n++) {
         gpos_t genome_start, genome_end;
 
-        if (rev[n] == 0) {
+        if (C->rev[n] == 0) {
             /* Forward strand */
-            genome_start = pos[n] + bestw - L;
-            genome_end = pos[n] + besty - L + 1;
+            genome_start = C->pos[n] + C->bestw - C->L;
+            genome_end = C->pos[n] + C->besty - C->L + 1;
         } else {
             /* Reverse strand: extension reads genome in opposite direction */
-            genome_start = pos[n] - (besty - L - l) - 1;
-            genome_end = pos[n] - (bestw - L - l);
+            genome_start = C->pos[n] - (C->besty - C->L - C->l) - 1;
+            genome_end = C->pos[n] - (C->bestw - C->L - C->l);
         }
 
         /* Bounds check — only keep instances from forward copy */
-        if (genome_start < 0 || genome_end > orig_length)
+        if (genome_start < 0 || genome_end > C->orig_length)
             continue;
 
         glen_t aligned_length = genome_end - genome_start;
@@ -1541,12 +1275,12 @@ static void collect_instances_from_extension(CandidateFamily *fam)
         int compare_len = (int)aligned_length < cons_len ? (int)aligned_length : cons_len;
         for (i = 0; i < compare_len; i++) {
             char seq_base;
-            if (rev[n] == 0) {
-                seq_base = sequence[genome_start + i];
+            if (C->rev[n] == 0) {
+                seq_base = C->sequence[genome_start + i];
             } else {
-                seq_base = compl_base(sequence[(int)(genome_end - 1 - i)]);
+                seq_base = compl_base(C->sequence[genome_end - 1 - i]);
             }
-            char cons_base = masters[R][masterstart[R] + i];
+            char cons_base = C->masters[C->R][C->masterstart[C->R] + i];
             if (seq_base == DNA_N || seq_base != cons_base)
                 edits++;
         }
@@ -1559,9 +1293,9 @@ static void collect_instances_from_extension(CandidateFamily *fam)
         inst->cons_end = cons_len;
         inst->num_edits = edits;
         inst->divergence = (compare_len > 0) ? (float)edits / (float)compare_len : 0.0f;
-        inst->score = bestbestscore[n];
-        inst->strand = rev[n] ? -1 : 1;
-        inst->seq_index = find_seq_index((int)genome_start);
+        inst->score = C->bestbestscore[n];
+        inst->strand = C->rev[n] ? -1 : 1;
+        inst->seq_index = find_seq_index(C, genome_start);
         fam->num_instances++;
     }
 }
@@ -1574,20 +1308,20 @@ static void collect_instances_from_extension(CandidateFamily *fam)
  * This doubles the occurrences per l-mer, giving stronger extension support.
  * ================================================================ */
 
-static char *build_doubled_genome(const char *orig_seq, int orig_len, int *new_len)
+static char *build_doubled_genome(const char *orig_seq, glen_t orig_len, glen_t *new_len)
 {
-    int doubled_len = 2 * orig_len + PADLENGTH;
-    char *doubled = malloc(doubled_len * sizeof(char));
+    glen_t doubled_len = 2 * orig_len + PADLENGTH;
+    char *doubled = malloc((size_t)doubled_len * sizeof(char));
     if (!doubled) return NULL;
 
     /* Copy forward strand */
-    memcpy(doubled, orig_seq, orig_len);
+    memcpy(doubled, orig_seq, (size_t)orig_len);
 
     /* PADLENGTH spacer (DNA_N = 99) */
     memset(doubled + orig_len, 99, PADLENGTH);
 
     /* Reverse complement */
-    for (int x = 0; x < orig_len; x++) {
+    for (glen_t x = 0; x < orig_len; x++) {
         if (orig_seq[orig_len - 1 - x] == 99)
             doubled[orig_len + PADLENGTH + x] = 99;
         else
@@ -1616,8 +1350,8 @@ void discover_default_params(DiscoverParams *params)
     params->MINIMPROVEMENT = 3;
     params->WHEN_TO_STOP   = 100;
     params->MAXENTROPY     = -0.7f;
-    params->GOODLENGTH     = 30;       /* plan: 50→30, MDL decides */
-    params->MINTHRESH      = 2;        /* plan: 3→2, let MDL decide */
+    params->GOODLENGTH     = 30;       /* plan: 50->30, MDL decides */
+    params->MINTHRESH      = 2;        /* plan: 3->2, let MDL decide */
     params->TANDEMDIST     = 500;
     params->VERBOSE        = 0;
     params->freq_file      = NULL;
@@ -1651,17 +1385,21 @@ static void reverse_if_necessary(char *lmer_buf, int lmer_len)
     /* Palindrome — no change needed */
 }
 
+struct freq_entry {
+    int freq;
+    gpos_t occ;
+};
+
 static int cmp_freq_desc(const void *a, const void *b)
 {
-    const int *fa = (const int *)a;
-    const int *fb = (const int *)b;
-    /* Each entry is 2 ints: [freq, occ]. Sort by freq descending. */
-    if (fa[0] > fb[0]) return -1;
-    if (fa[0] < fb[0]) return  1;
+    const struct freq_entry *fa = (const struct freq_entry *)a;
+    const struct freq_entry *fb = (const struct freq_entry *)b;
+    if (fa->freq > fb->freq) return -1;
+    if (fa->freq < fb->freq) return  1;
     return 0;
 }
 
-static void dump_freq_table(struct llist **hp, const char *path)
+static void dump_freq_table(DiscoverContext *C, struct llist **hp, const char *path)
 {
     FILE *fp = fopen(path, "w");
     if (!fp) {
@@ -1671,13 +1409,13 @@ static void dump_freq_table(struct llist **hp, const char *path)
 
     /* Count entries */
     int count = 0;
-    for (int h = 0; h < HASH_SIZE; h++) {
+    for (gpos_t h = 0; h < C->hash_size; h++) {
         struct llist *tmp = hp[h];
         while (tmp) { count++; tmp = tmp->next; }
     }
 
     /* Collect (freq, occ) pairs */
-    int (*entries)[2] = malloc((size_t)count * sizeof(*entries));
+    struct freq_entry *entries = malloc((size_t)count * sizeof(*entries));
     if (!entries) {
         fprintf(stderr, "discover: out of memory for freq dump\n");
         fclose(fp);
@@ -1685,11 +1423,11 @@ static void dump_freq_table(struct llist **hp, const char *path)
     }
 
     int idx = 0;
-    for (int h = 0; h < HASH_SIZE; h++) {
+    for (gpos_t h = 0; h < C->hash_size; h++) {
         struct llist *tmp = hp[h];
         while (tmp) {
-            entries[idx][0] = tmp->freq;
-            entries[idx][1] = tmp->lastocc;
+            entries[idx].freq = tmp->freq;
+            entries[idx].occ = tmp->lastocc;
             idx++;
             tmp = tmp->next;
         }
@@ -1701,13 +1439,13 @@ static void dump_freq_table(struct llist **hp, const char *path)
     /* Write */
     char lmer_buf[256];
     for (int i = 0; i < count; i++) {
-        int occ = entries[i][1];
-        for (int x = 0; x < l; x++)
-            lmer_buf[x] = sequence[occ + x];
-        reverse_if_necessary(lmer_buf, l);
-        for (int x = 0; x < l; x++)
+        gpos_t occ = entries[i].occ;
+        for (int x = 0; x < C->l; x++)
+            lmer_buf[x] = C->sequence[occ + x];
+        reverse_if_necessary(lmer_buf, C->l);
+        for (int x = 0; x < C->l; x++)
             fputc(num_to_char(lmer_buf[x]), fp);
-        fprintf(fp, "\t%d\t%d\n", entries[i][0], entries[i][1]);
+        fprintf(fp, "\t%d\t%" PRId64 "\n", entries[i].freq, entries[i].occ);
     }
 
     free(entries);
@@ -1720,109 +1458,136 @@ static void dump_freq_table(struct llist **hp, const char *path)
  * ================================================================ */
 
 CandidateList *discover_families(const Genome *genome,
-                                 const DiscoverParams *params)
+                                 const DiscoverParams *params,
+                                 int num_threads)
 {
     struct llist **headptr;
     struct llist *besttmp;
     int x;
 
+    /* ---- Allocate context ---- */
+    DiscoverContext *C = calloc(1, sizeof(DiscoverContext));
+    if (!C) return NULL;
+
     /* ---- Set parameters from DiscoverParams ---- */
-    l              = params->l;
-    L              = params->L;
-    MAXOFFSET      = params->MAXOFFSET;
-    MAXN           = params->MAXN;
-    MAXR           = params->MAXR;
-    MATCH          = params->MATCH;
-    MISMATCH       = params->MISMATCH;
-    GAP            = params->GAP;
-    CAPPENALTY     = params->CAPPENALTY;
-    MINIMPROVEMENT = params->MINIMPROVEMENT;
-    WHEN_TO_STOP   = params->WHEN_TO_STOP;
-    MAXENTROPY     = params->MAXENTROPY;
-    GOODLENGTH     = params->GOODLENGTH;
-    MINTHRESH      = params->MINTHRESH;
-    TANDEMDIST     = params->TANDEMDIST;
-    VERBOSE        = params->VERBOSE;
+    C->l              = params->l;
+    C->L              = params->L;
+    C->MAXOFFSET      = params->MAXOFFSET;
+    C->MAXN           = params->MAXN;
+    C->MAXR           = params->MAXR;
+    C->MATCH          = params->MATCH;
+    C->MISMATCH       = params->MISMATCH;
+    C->GAP            = params->GAP;
+    C->CAPPENALTY     = params->CAPPENALTY;
+    C->MINIMPROVEMENT = params->MINIMPROVEMENT;
+    C->WHEN_TO_STOP   = params->WHEN_TO_STOP;
+    C->MAXENTROPY     = params->MAXENTROPY;
+    C->GOODLENGTH     = params->GOODLENGTH;
+    C->MINTHRESH      = params->MINTHRESH;
+    C->TANDEMDIST     = params->TANDEMDIST;
+    C->VERBOSE        = params->VERBOSE;
 
     /* ---- Setup genome data ---- */
-    orig_length = (int)genome->length;
-    disc_num_sequences = genome->num_sequences;
+    C->orig_length = genome->length;
+    C->disc_num_sequences = genome->num_sequences;
 
     /* Auto-compute l if not specified (use original length) */
-    if (l <= 0)
-        l = (int)ceil(1.0 + log((double)orig_length) / log(4.0));
+    if (C->l <= 0)
+        C->l = (int)ceil(1.0 + log((double)C->orig_length) / log(4.0));
+
+    /* Dynamic hash size: at least HASH_SIZE_MIN, but scale with genome/l.
+     * 4 * genome_len / l gives ~4 entries per bucket on average for a
+     * fully loaded table.  Round up to next odd number (not necessarily
+     * prime, but good enough for this chained hash). */
+    {
+        gpos_t dynamic_size = 4 * C->orig_length / C->l;
+        if (dynamic_size % 2 == 0) dynamic_size++;   /* keep odd */
+        C->hash_size = (dynamic_size > HASH_SIZE_MIN) ? dynamic_size : HASH_SIZE_MIN;
+    }
+    fprintf(stderr, "discover: hash_size=%" PRId64 " (genome=%" PRId64 " l=%d)\n",
+            C->hash_size, C->orig_length, C->l);
 
     fprintf(stderr, "discover: l=%d, L=%d, MAXOFFSET=%d, MINTHRESH=%d, GOODLENGTH=%d\n",
-            l, L, MAXOFFSET, MINTHRESH, GOODLENGTH);
+            C->l, C->L, C->MAXOFFSET, C->MINTHRESH, C->GOODLENGTH);
 
     /* Build doubled genome: forward + PADLENGTH padding + RC */
-    int doubled_len;
-    sequence_owned = build_doubled_genome(genome->sequence, orig_length, &doubled_len);
-    if (!sequence_owned) {
+    glen_t doubled_len;
+    C->sequence_owned = build_doubled_genome(genome->sequence, C->orig_length, &doubled_len);
+    if (!C->sequence_owned) {
         fprintf(stderr, "discover: out of memory for doubled genome\n");
+        free(C);
         return NULL;
     }
-    sequence = sequence_owned;
-    length = doubled_len;
+    C->sequence = C->sequence_owned;
+    C->length = doubled_len;
 
-    /* Copy boundaries to int array (RepeatScout uses int) */
-    disc_boundaries = malloc((disc_num_sequences + 1) * sizeof(int));
-    if (!disc_boundaries) {
+    /* Copy boundaries to gpos_t array */
+    C->disc_boundaries = malloc((C->disc_num_sequences + 1) * sizeof(gpos_t));
+    if (!C->disc_boundaries) {
         fprintf(stderr, "discover: out of memory for boundaries\n");
-        free(sequence_owned); sequence_owned = NULL;
+        free(C->sequence_owned);
+        free(C);
         return NULL;
     }
-    for (int i = 0; i <= disc_num_sequences; i++)
-        disc_boundaries[i] = (int)genome->boundaries[i];
+    for (int i = 0; i <= C->disc_num_sequences; i++)
+        C->disc_boundaries[i] = genome->boundaries[i];
 
     /* Allocate masking array (covers doubled genome) */
-    removed = calloc(length, sizeof(char));
-    if (!removed) {
+    C->removed = calloc((size_t)C->length, sizeof(char));
+    if (!C->removed) {
         fprintf(stderr, "discover: out of memory for masking array\n");
-        free(disc_boundaries);
-        free(sequence_owned); sequence_owned = NULL;
+        free(C->disc_boundaries);
+        free(C->sequence_owned);
+        free(C);
         return NULL;
     }
 
     /* ---- Allocate workspace ---- */
-    if (allocate_workspace() < 0) {
+    if (allocate_workspace(C) < 0) {
         fprintf(stderr, "discover: out of memory for workspace\n");
-        free(removed);
-        free(disc_boundaries);
-        free(sequence_owned); sequence_owned = NULL;
+        free(C->removed);
+        free(C->disc_boundaries);
+        free(C->sequence_owned);
+        free(C);
         return NULL;
     }
 
     /* ---- Build hash table ---- */
-    headptr = malloc(HASH_SIZE * sizeof(*headptr));
+    headptr = calloc((size_t)C->hash_size, sizeof(*headptr));
     if (!headptr) {
         fprintf(stderr, "discover: out of memory for headptr\n");
-        free_workspace();
+        free_workspace(C);
+        free(C);
         return NULL;
     }
 
     if (params->freq_file) {
         fprintf(stderr, "discover: reading frequency table from %s\n", params->freq_file);
-        build_headptr_from_freq(headptr, params->freq_file);
+        build_headptr_from_freq(C, headptr, params->freq_file);
+    } else if (num_threads > 1) {
+        fprintf(stderr, "discover: counting l-mers in parallel (%d threads)...\n",
+                num_threads);
+        build_headptr_parallel(C, headptr, num_threads);
     } else {
         fprintf(stderr, "discover: counting l-mers internally...\n");
-        build_headptr_internal(headptr);
+        build_headptr_internal(C, headptr);
     }
 
     /* Dump frequency table if requested (before trim, same as build_lmer_table) */
     if (params->freq_output) {
-        dump_freq_table(headptr, params->freq_output);
+        dump_freq_table(C, headptr, params->freq_output);
     }
 
-    trim_headptr(headptr);
-    build_all_pos(headptr);
+    trim_headptr(C, headptr);
+    build_all_pos(C, headptr);
 
     /* ---- Allocate result ---- */
     CandidateList *result = malloc(sizeof(CandidateList));
     if (!result) {
         fprintf(stderr, "discover: out of memory for result\n");
-        free_headptr(headptr);
-        free_workspace();
+        free_headptr(headptr, C->hash_size);
+        free_workspace(C);
+        free(C);
         return NULL;
     }
     result->cap_families = 1024;
@@ -1830,69 +1595,70 @@ CandidateList *discover_families(const Genome *genome,
     if (!result->families) {
         fprintf(stderr, "discover: out of memory for families\n");
         free(result);
-        free_headptr(headptr);
-        free_workspace();
+        free_headptr(headptr, C->hash_size);
+        free_workspace(C);
+        free(C);
         return NULL;
     }
     result->num_families = 0;
 
     /* ---- Main discovery loop ---- */
-    R = 0;
-    prevbestfreq = 1000000000;
-    prevbesthash = 0;
+    C->R = 0;
+    C->prevbestfreq = 1000000000;
+    C->prevbesthash = 0;
 
     while (1) {
-        besttmp = find_besttmp(headptr);
+        besttmp = find_besttmp(C, headptr);
 
-        if (besttmp == NULL || besttmp->freq < MINTHRESH) {
-            if (VERBOSE)
-                fprintf(stderr, "discover: stopped at R=%d (no more frequent l-mers)\n", R);
+        if (besttmp == NULL || besttmp->freq < C->MINTHRESH) {
+            if (C->VERBOSE)
+                fprintf(stderr, "discover: stopped at R=%d (no more frequent l-mers)\n", C->R);
             break;
         }
 
         /* Initialize seed in master */
-        for (x = 0; x < l; x++)
-            master[L + x] = sequence[besttmp->lastocc + x];
+        for (x = 0; x < C->l; x++)
+            C->master[C->L + x] = C->sequence[besttmp->lastocc + x];
 
         /* Build occurrence list */
-        build_pos(besttmp);
+        build_pos(C, besttmp);
 
-        if (N < MINTHRESH) {
-            if (VERBOSE >= 2)
+        if (C->N < C->MINTHRESH) {
+            if (C->VERBOSE >= 2)
                 fprintf(stderr, "discover: R=%d N=%d < MINTHRESH=%d, updating freq\n",
-                        R, N, MINTHRESH);
-            besttmp->freq = N;
+                        C->R, C->N, C->MINTHRESH);
+            besttmp->freq = C->N;
             continue;
         }
 
         /* Initialize offset tracking */
-        for (int n = 0; n < N; n++) {
-            best_left_offset[n] = -1;
-            save_left_offset[n] = -1;
-            best_right_offset[n] = -1;
-            save_right_offset[n] = -1;
+        for (int n = 0; n < C->N; n++) {
+            C->best_left_offset[n] = -1;
+            C->save_left_offset[n] = -1;
+            C->best_right_offset[n] = -1;
+            C->save_right_offset[n] = -1;
         }
 
         /* Allocate masters[R] if needed */
-        if (masters_allocated[R] == 0) {
-            masters[R] = malloc((2 * L + l) * sizeof(char));
-            if (!masters[R]) {
-                fprintf(stderr, "discover: out of memory for masters[%d]\n", R);
+        if (C->masters_allocated[C->R] == 0) {
+            C->masters[C->R] = malloc((2 * C->L + C->l) * sizeof(char));
+            if (!C->masters[C->R]) {
+                fprintf(stderr, "discover: out of memory for masters[%d]\n", C->R);
                 break;
             }
-            masters_allocated[R] = 1;
+            C->masters_allocated[C->R] = 1;
         }
 
         /* Extend right and left */
-        extend_right();
-        extend_left();
+        extend_right(C);
+        extend_left(C);
 
-        int cons_len = masterend[R] - masterstart[R] + 1;
+        int cons_len = C->masterend[C->R] - C->masterstart[C->R] + 1;
 
-        if (cons_len >= GOODLENGTH) {
+        if (cons_len >= C->GOODLENGTH) {
             /* Good family: save and collect instances */
-            if (VERBOSE) {
-                fprintf(stderr, "discover: R=%d N=%d length=%d\n", R, N, cons_len);
+            if (C->VERBOSE) {
+                fprintf(stderr, "discover: R=%d N=%d length=%d\n", C->R, C->N, cons_len);
             }
 
             /* Grow result array if needed */
@@ -1919,39 +1685,40 @@ CandidateList *discover_families(const Genome *genome,
                 break;
             }
             for (x = 0; x < cons_len; x++)
-                fam->consensus[x] = masters[R][masterstart[R] + x];
+                fam->consensus[x] = C->masters[C->R][C->masterstart[C->R] + x];
             fam->consensus_length = cons_len;
 
             /* Set default fields */
             fam->topology = TOPO_LINEAR;
             fam->component_id = 0;
-            fam->estimated_copies = N;
+            fam->estimated_copies = C->N;
 
             /* Collect instances from extension occurrences */
-            collect_instances_from_extension(fam);
+            collect_instances_from_extension(C, fam);
 
             result->num_families++;
 
-            R++;
-            if (R == MAXR) break;
+            C->R++;
+            if (C->R == C->MAXR) break;
 
             /* Mask this family */
-            mask_headptr(headptr);
+            mask_headptr(C, headptr);
         } else {
             /* Short family: mask but don't record */
-            R++;
-            if (R == MAXR) break;
-            mask_headptr(headptr);
-            R--;
+            C->R++;
+            if (C->R == C->MAXR) break;
+            mask_headptr(C, headptr);
+            C->R--;
         }
     }
 
     fprintf(stderr, "discover: found %d families (R=%d total including short)\n",
-            result->num_families, R);
+            result->num_families, C->R);
 
     /* ---- Cleanup ---- */
-    free_headptr(headptr);
-    free_workspace();
+    free_headptr(headptr, C->hash_size);
+    free_workspace(C);
+    free(C);
 
     return result;
 }

@@ -3,8 +3,23 @@
 #include <string.h>
 #include <limits.h>
 #include <pthread.h>
+#include <unistd.h>
 
 #include "align.h"
+
+/* Local strdup replacement to avoid _POSIX_C_SOURCE conflicts with uid_t */
+static char *align_strdup(const char *s)
+{
+    size_t n = strlen(s) + 1;
+    char *p = malloc(n);
+    if (p) memcpy(p, s, n);
+    return p;
+}
+
+/* Runtime-configurable refinement parameters (defaults match original #defines) */
+int   g_align_gap            = -5;
+int   g_align_maxoffset      = 12;
+float g_align_max_divergence = 0.30f;
 
 /* ================================================================
  * Internal constants
@@ -12,8 +27,14 @@
 
 #define MAX_SEED_HITS    50000   /* cap per-family seed hits */
 #define MAX_CONS_KMERS   10000   /* cap consensus k-mer set entries */
-#define BAND_WIDTH       (2 * ALIGN_MAXOFFSET + 1)
-#define ALIGN_MAX_EXTENSION 10000  /* max bases to extend per direction */
+#define MAX_BAND_WIDTH   (2 * ALIGN_MAXOFFSET_LIMIT + 1)
+#define ALIGN_MAX_EXTENSION 10000  /* max bases to extend per direction per iteration */
+/* J' (v6) reverted: bumping to 20000 caused align_refine to overshoot true element
+ * boundaries by 3-5 kb on synthetic ATHILA-like elements, producing chimeric
+ * consensus that MDL rejects. K's banded DP + larger cap lets consensus drift
+ * into random background. See V6_PHASE3_RESULT.md BIO-N2 failure. Keep at 10000;
+ * for very large LTR elements (>20kb), the per-iteration cap × 10 iters = 100kb
+ * still allows full-length recovery. */
 
 /* ================================================================
  * Consensus k-mer hash set (small, for one family at a time)
@@ -256,9 +277,10 @@ static AlignedInstance align_banded(const CandidateFamily *fam,
     int anchor_cons = anchor->cons_pos;
     gpos_t anchor_genome = anchor->genome_pos;
 
-    /* DP arrays: two rows, each of width BAND_WIDTH.
-     * offset index: o ∈ [0, BAND_WIDTH-1], actual offset = o - MAXOFFSET */
-    int dp[2][BAND_WIDTH];
+    /* DP arrays: two rows, each of width (2*maxoffset+1).
+     * offset index: o ∈ [0, band_width-1], actual offset = o - maxoffset */
+    int band_width = 2 * g_align_maxoffset + 1;
+    int dp[2][MAX_BAND_WIDTH];
     int prev_row, curr_row;
 
     /* --- Extend RIGHT from anchor --- */
@@ -268,9 +290,9 @@ static AlignedInstance align_banded(const CandidateFamily *fam,
 
     /* Initialize DP at anchor position */
     prev_row = 0;
-    for (int o = 0; o < BAND_WIDTH; o++)
+    for (int o = 0; o < band_width; o++)
         dp[prev_row][o] = ALIGN_CAPPENALTY;
-    dp[prev_row][ALIGN_MAXOFFSET] = 0; /* offset 0 = exact alignment */
+    dp[prev_row][g_align_maxoffset] = 0; /* offset 0 = exact alignment */
 
     /* Score the anchor position itself */
     {
@@ -280,7 +302,7 @@ static AlignedInstance align_banded(const CandidateFamily *fam,
         char cb = fam->consensus[anchor_cons];
         if (gb != DNA_N && cb != DNA_N) {
             int s = (gb == cb) ? ALIGN_MATCH : ALIGN_MISMATCH;
-            dp[prev_row][ALIGN_MAXOFFSET] = s;
+            dp[prev_row][g_align_maxoffset] = s;
             best_right_score = s;
         }
         right_end_cons = anchor_cons + 1;
@@ -290,11 +312,11 @@ static AlignedInstance align_banded(const CandidateFamily *fam,
     for (int i = anchor_cons + 1; i < cons_len; i++) {
         curr_row = 1 - prev_row;
 
-        for (int o = 0; o < BAND_WIDTH; o++)
+        for (int o = 0; o < band_width; o++)
             dp[curr_row][o] = ALIGN_CAPPENALTY;
 
-        for (int o = 0; o < BAND_WIDTH; o++) {
-            int actual_offset = o - ALIGN_MAXOFFSET;
+        for (int o = 0; o < band_width; o++) {
+            int actual_offset = o - g_align_maxoffset;
             gpos_t gp = genome_pos_for_cons(anchor_genome, anchor_cons,
                                             i, anchor->strand);
             gp += actual_offset;
@@ -310,12 +332,12 @@ static AlignedInstance align_banded(const CandidateFamily *fam,
             int val = dp[prev_row][o] + diag;
 
             /* Gap in genome: offset shifts by +1 (previous o+1) */
-            if (o + 1 < BAND_WIDTH && dp[prev_row][o + 1] + ALIGN_GAP > val)
-                val = dp[prev_row][o + 1] + ALIGN_GAP;
+            if (o + 1 < band_width && dp[prev_row][o + 1] + g_align_gap > val)
+                val = dp[prev_row][o + 1] + g_align_gap;
 
             /* Gap in consensus: offset shifts by -1 (previous o-1) */
-            if (o > 0 && dp[prev_row][o - 1] + ALIGN_GAP > val)
-                val = dp[prev_row][o - 1] + ALIGN_GAP;
+            if (o > 0 && dp[prev_row][o - 1] + g_align_gap > val)
+                val = dp[prev_row][o - 1] + g_align_gap;
 
             /* Cap penalty floor */
             if (val < best_right_score + ALIGN_CAPPENALTY)
@@ -344,19 +366,19 @@ static AlignedInstance align_banded(const CandidateFamily *fam,
 
     /* Re-initialize DP */
     prev_row = 0;
-    for (int o = 0; o < BAND_WIDTH; o++)
+    for (int o = 0; o < band_width; o++)
         dp[prev_row][o] = ALIGN_CAPPENALTY;
-    dp[prev_row][ALIGN_MAXOFFSET] = 0;
+    dp[prev_row][g_align_maxoffset] = 0;
 
     stall = 0;
     for (int i = anchor_cons - 1; i >= 0; i--) {
         curr_row = 1 - prev_row;
 
-        for (int o = 0; o < BAND_WIDTH; o++)
+        for (int o = 0; o < band_width; o++)
             dp[curr_row][o] = ALIGN_CAPPENALTY;
 
-        for (int o = 0; o < BAND_WIDTH; o++) {
-            int actual_offset = o - ALIGN_MAXOFFSET;
+        for (int o = 0; o < band_width; o++) {
+            int actual_offset = o - g_align_maxoffset;
             gpos_t gp = genome_pos_for_cons(anchor_genome, anchor_cons,
                                             i, anchor->strand);
             gp += actual_offset;
@@ -370,11 +392,11 @@ static AlignedInstance align_banded(const CandidateFamily *fam,
 
             int val = dp[prev_row][o] + diag;
 
-            if (o + 1 < BAND_WIDTH && dp[prev_row][o + 1] + ALIGN_GAP > val)
-                val = dp[prev_row][o + 1] + ALIGN_GAP;
+            if (o + 1 < band_width && dp[prev_row][o + 1] + g_align_gap > val)
+                val = dp[prev_row][o + 1] + g_align_gap;
 
-            if (o > 0 && dp[prev_row][o - 1] + ALIGN_GAP > val)
-                val = dp[prev_row][o - 1] + ALIGN_GAP;
+            if (o > 0 && dp[prev_row][o - 1] + g_align_gap > val)
+                val = dp[prev_row][o - 1] + g_align_gap;
 
             if (val < best_left_score + ALIGN_CAPPENALTY)
                 val = best_left_score + ALIGN_CAPPENALTY;
@@ -414,7 +436,15 @@ static AlignedInstance align_banded(const CandidateFamily *fam,
     }
     gend++; /* exclusive */
 
-    /* Count actual edits in the aligned region */
+    /* Count actual edits in the aligned region.
+     *
+     * DESIGN NOTE (Audit §C3): This counts substitutions only, not gaps.
+     * The banded DP above handles gaps for scoring and boundary detection,
+     * but the traceback needed to identify gap positions is not performed.
+     * Effect on MDL: instance cost is slightly underestimated → savings
+     * biased upward → favors acceptance.  Impact is < 3% (TE copies have
+     * gap rates ~1/5 to 1/10 of substitution rates).  A full traceback
+     * would add complexity for marginal MDL accuracy improvement. */
     int edits = 0;
     int compared = 0;
     for (int i = left_start_cons; i < right_end_cons; i++) {
@@ -428,7 +458,7 @@ static AlignedInstance align_banded(const CandidateFamily *fam,
     }
 
     float div = (compared > 0) ? (float)edits / (float)compared : 1.0f;
-    if (div > ALIGN_MAX_DIVERGENCE) return result;
+    if (div > g_align_max_divergence) return result;
 
     /* Fill result */
     result.genome_start = gstart;
@@ -442,6 +472,102 @@ static AlignedInstance align_banded(const CandidateFamily *fam,
 
     return result;
 }
+
+/* ================================================================
+ * Step 4a: BLAST-based instance recruitment for short families
+ * ================================================================ */
+
+/*
+ * Detect blastn in PATH.  Checks the PGTA conda env first, then PATH.
+ * Returns a malloc'd path string on success, NULL if not found.
+ * Caller must free() the returned string.
+ */
+static char *find_blastn(void)
+{
+    /* Preferred: PGTA conda env (known-good version) */
+    static const char *candidates[] = {
+        "/home/shuoc/tool/miniconda3/envs/PGTA/bin/blastn",
+        NULL
+    };
+    for (int i = 0; candidates[i]; i++) {
+        if (access(candidates[i], X_OK) == 0)
+            return align_strdup(candidates[i]);
+    }
+    /* Fall back to PATH via 'which blastn' */
+    FILE *fp = popen("which blastn 2>/dev/null", "r");
+    if (!fp) return NULL;
+    char buf[512];
+    buf[0] = '\0';
+    if (fgets(buf, sizeof(buf), fp)) {
+        /* Strip trailing newline */
+        size_t l = strlen(buf);
+        while (l > 0 && (buf[l-1] == '\n' || buf[l-1] == '\r'))
+            buf[--l] = '\0';
+    }
+    pclose(fp);
+    if (buf[0] != '\0' && access(buf, X_OK) == 0)
+        return align_strdup(buf);
+    return NULL;
+}
+
+/* Cached blastn path result: 0 = unchecked, 1 = found (g_blastn_path set),
+ * -1 = not available.  Protected by a simple flag (called from parallel
+ * threads, but all threads do the same idempotent check; worst case the
+ * check runs multiple times which is harmless). */
+static volatile int g_blastn_checked = 0;
+static char *g_blastn_path = NULL;
+
+static int blastn_available(void)
+{
+    if (g_blastn_checked == 0) {
+        char *p = find_blastn();
+        if (p) {
+            g_blastn_path = p;
+            g_blastn_checked = 1;
+        } else {
+            g_blastn_checked = -1;
+        }
+    }
+    return (g_blastn_checked == 1);
+}
+
+/*
+ * Write genome raw sequences (unpadded, ASCII) to a temp FASTA.
+ * seq_raw_starts[i] = raw offset where sequence i starts (for coord remapping).
+ * Returns 0 on success, -1 on error.
+ */
+static int write_genome_fasta(const Genome *genome, const char *path,
+                               gpos_t *seq_raw_starts, int max_seqs)
+{
+    FILE *fp = fopen(path, "w");
+    if (!fp) return -1;
+
+    for (int i = 0; i < genome->num_sequences && i < max_seqs; i++) {
+        gpos_t raw_start = (i == 0) ? 0 : genome->boundaries[i - 1];
+        gpos_t raw_end   = genome->boundaries[i];
+        /* Last sequence boundary has sentinel +1; strip it */
+        if (i == genome->num_sequences - 1 && raw_end > 0)
+            raw_end -= 1;
+
+        seq_raw_starts[i] = raw_start;
+
+        const char *seqid = (genome->sequence_ids && genome->sequence_ids[i])
+                            ? genome->sequence_ids[i] : "seq";
+        fprintf(fp, ">%s\n", seqid);
+        for (gpos_t j = raw_start; j < raw_end; j++) {
+            fputc(num_to_char(genome->sequence[PADLENGTH + j]), fp);
+            if ((j - raw_start + 1) % 80 == 0) fputc('\n', fp);
+        }
+        if ((raw_end - raw_start) % 80 != 0) fputc('\n', fp);
+    }
+    fclose(fp);
+    return 0;
+}
+
+/* BLAST_SHORT_THRESHOLD and BLAST_MIN_PIDENT used by batch recruitment below */
+#define BLAST_SHORT_THRESHOLD  500
+#define BLAST_MIN_PIDENT       70.0f
+
 
 /* ================================================================
  * Step 4: align_collect_instances — orchestrator
@@ -496,6 +622,17 @@ int align_collect_instances(CandidateFamily *fam, const Genome *genome,
     }
     fam->cap_instances = cap;
 
+    /* Minimum instance length: an alignment shorter than this is
+     * almost certainly a noisy seed-level match, not a real repeat
+     * occurrence.  Without this filter the output BED can be polluted
+     * with 11-15 bp fragments (observed on testD, where SINE seeds
+     * find spurious tiny matches in the genome background).
+     *
+     * Threshold: max(k + 10, 30).  Below k+10 the alignment can't
+     * extend meaningfully past the seed; below 30 bp it has no
+     * biological meaning regardless of seed length. */
+    int min_instance_len = (k + 10 > 30) ? (k + 10) : 30;
+
     /* Step 3: Banded alignment for each anchor */
     for (int i = 0; i < n_anchors && fam->num_instances < DEFAULT_MAXN; i++) {
         AlignedInstance ai = align_banded(fam, genome, &anchors[i]);
@@ -507,6 +644,7 @@ int align_collect_instances(CandidateFamily *fam, const Genome *genome,
         if (ai.genome_end > genome->length) continue;
         if (!genome_check_boundary(genome, ai.genome_start, alen))
             continue;
+        if (alen < min_instance_len) continue;
 
         /* Check for duplicate: skip if overlapping an existing instance */
         int is_dup = 0;
@@ -623,108 +761,317 @@ int align_rebuild_consensus(CandidateFamily *fam, const Genome *genome)
 }
 
 /* ================================================================
- * Step 5b: Consensus extension via flanking context
+ * Step 5b: Consensus extension via flanking context (banded DP)
  * ================================================================ */
 
 /*
- * Extend consensus in one direction using majority voting over instance
- * flanking genome bases.  direction: +1 = right, -1 = left.
+ * Compute the genome base contributed by instance `inst` at extension
+ * column `y` (0-based, distance from current consensus edge) under
+ * a given DP `offset` for direction +1/-1.  Returns DNA_N if out of
+ * bounds.  Reverse-strand complementing is applied here.
+ *
+ * Coordinate mapping mirrors the existing linear formula in
+ * align_rebuild_consensus, augmented with the offset adjustment that
+ * the banded DP uses to absorb small indels:
+ *   direction = +1 (right): consensus position p = consensus_length + y
+ *   direction = -1 (left):  consensus position p = -(y + 1)
+ *   forward strand: gp = position + (p - cons_start) + offset
+ *   reverse strand: gp = position + (cons_end - 1 - p) - offset
+ */
+static inline char ext_genome_base(const Instance *inst, const Genome *genome,
+                                   int direction, int cons_len,
+                                   int y, int offset)
+{
+    int p;
+    if (direction > 0) p = cons_len + y;
+    else               p = -(y + 1);
+
+    gpos_t gp;
+    if (inst->strand > 0) {
+        gp = inst->position + (p - inst->cons_start) + offset;
+    } else {
+        gp = inst->position + (inst->cons_end - 1 - p) - offset;
+    }
+
+    if (gp < 0 || gp >= genome->length) return DNA_N;
+    char base = genome->sequence[gp];
+    if (inst->strand < 0) base = dna_complement(base);
+    if (base < 0 || base > 3) return DNA_N;
+    return base;
+}
+
+/*
+ * Mirror of discover.c::compute_score_right adapted for refine-stage
+ * extension.  Computes the best DP score for instance n at column y,
+ * offset `offset`, assuming consensus base `a` is appended.
+ *
+ * The scoring follows RepeatScout's three-case structure:
+ *   A) gap in sequence  (oldoffset = offset+1)
+ *   B) diagonal         (oldoffset = offset)
+ *   C) multiple-gap     (oldoffset < offset; takes match if any pos matches)
+ *
+ * Returns 0 when the underlying genome position is out of bounds for
+ * that instance — same convention as discover.c (boundary → score 0).
+ */
+typedef struct {
+    int   N;                    /* number of contributing instances */
+    int   maxoffset;
+    int   band_width;
+    int   direction;            /* +1 right, -1 left */
+    int   cons_len;             /* consensus_length at start of extension */
+    int **score[2];             /* score[parity][n] -> band_width ints */
+    int  *bestbestscore;        /* per-instance best score so far */
+    Instance     *insts;        /* contributing instance pointers, length N */
+    const Genome *genome;
+} ExtDP;
+
+static int ext_compute_score(const ExtDP *D, int y, int n, int offset, char a)
+{
+    int oldoffset, tempscore, ans;
+    int prev = (y - 1) & 1;
+    int M = D->maxoffset;
+
+    /* Boundary check: if reading column y at this offset is out of
+     * the genome for this instance, abort this DP cell with score 0. */
+    char gb = ext_genome_base(&D->insts[n], D->genome, D->direction,
+                              D->cons_len, y, offset);
+    if (gb == DNA_N) return 0;
+
+    ans = -1000000000;
+
+    /* Case A: gap in sequence (oldoffset = offset+1) */
+    if (offset < M) {
+        oldoffset = offset + 1;
+        tempscore = D->score[prev][n][oldoffset + M] + g_align_gap;
+        if (tempscore > ans) ans = tempscore;
+    }
+
+    /* Case B: diagonal (oldoffset = offset) */
+    oldoffset = offset;
+    tempscore = D->score[prev][n][oldoffset + M];
+    tempscore += (a == gb) ? ALIGN_MATCH : ALIGN_MISMATCH;
+    if (tempscore > ans) ans = tempscore;
+
+    /* Case C: multiple gaps in consensus (oldoffset < offset).
+     * Match if any position in the spanned range matches `a`. */
+    for (oldoffset = -M; oldoffset < offset; oldoffset++) {
+        int ismatch = 0;
+        for (int x = oldoffset; x <= offset; x++) {
+            char gbx = ext_genome_base(&D->insts[n], D->genome, D->direction,
+                                       D->cons_len, y, x);
+            if (gbx != DNA_N && a == gbx) { ismatch = 1; break; }
+        }
+        tempscore = D->score[prev][n][oldoffset + M];
+        tempscore += (offset - oldoffset) * g_align_gap;
+        tempscore += ismatch ? ALIGN_MATCH : ALIGN_MISMATCH;
+        if (tempscore > ans) ans = tempscore;
+    }
+
+    return ans;
+}
+
+/*
+ * Extend consensus in one direction using banded dynamic programming.
+ *   direction: +1 = right, -1 = left.
+ * Indels of width <= MAXOFFSET in any single instance are absorbed by
+ * the band, so a single insertion no longer causes that instance to
+ * vote for the wrong column for the rest of the extension.
+ *
  * Returns number of bases extended.
  */
 static int extend_direction(CandidateFamily *fam, const Genome *genome,
                             int direction, int max_ext)
 {
     int extended = 0;
-    int best_score = 0;
-    int score = 0;
-    int stall = 0;
-    int best_extended = 0;
 
     if (max_ext > ALIGN_MAX_EXTENSION) max_ext = ALIGN_MAX_EXTENSION;
+    if (max_ext < 1) return 0;
 
-    char *ext_buf = malloc((size_t)max_ext);
-    if (!ext_buf) return 0;
+    int cons_len_at_start = fam->consensus_length;
+    int M = g_align_maxoffset;
+    if (M > ALIGN_MAXOFFSET_LIMIT) M = ALIGN_MAXOFFSET_LIMIT;
+    int band_width = 2 * M + 1;
 
-    for (int offset = 0; offset < max_ext; offset++) {
-        /* Consensus position being probed (beyond current bounds) */
-        int p;
-        if (direction > 0)
-            p = fam->consensus_length + offset;
-        else
-            p = -(offset + 1);
-
-        int count[4] = {0, 0, 0, 0};
-
-        for (int j = 0; j < fam->num_instances; j++) {
-            Instance *inst = &fam->instances[j];
-
-            /* Only use instances that reach near the edge being extended */
-            if (direction > 0) {
-                if (inst->cons_end < fam->consensus_length - EXTENSION_SLACK) continue;
-            } else {
-                if (inst->cons_start > EXTENSION_SLACK) continue;
-            }
-
-            /* Compute genome position using existing linear mapping */
-            gpos_t gp;
-            if (inst->strand > 0) {
-                gp = inst->position + (p - inst->cons_start);
-            } else {
-                gp = inst->position + (inst->cons_end - 1 - p);
-            }
-
-            if (gp < 0 || gp >= genome->length) continue;
-
-            char base = genome->sequence[gp];
-            if (inst->strand < 0)
-                base = dna_complement(base);
-
-            if (base >= 0 && base <= 3)
-                count[(int)base]++;
-        }
-
-        int total = count[0] + count[1] + count[2] + count[3];
-        if (total < 2) break;  /* insufficient coverage */
-
-        /* Dynamic minimum support: require more instances for longer extensions.
-         * Prevents segdup over-extension: 2 identical copies score +1 at every
-         * position (100% agreement), so WHEN_TO_STOP never triggers. This check
-         * ensures that extensions > 1000bp need ≥ 3 supporting instances. */
-        if (extended > 1000 && total < 3) break;
-        if (extended > 5000 && total < 5) break;
-
-        /* Find majority base */
-        int best_base = 0;
-        for (int b = 1; b < 4; b++) {
-            if (count[b] > count[best_base])
-                best_base = b;
-        }
-
-        /* Hard stop if no clear majority (< 50%) */
-        if (count[best_base] * 2 < total) break;
-
-        ext_buf[extended] = (char)best_base;
-        extended++;
-
-        /* Score tracking: +1 if strong support (>=60%), -1 otherwise */
-        score += (count[best_base] * 10 >= total * 6) ? 1 : -1;
-
-        if (score > best_score) {
-            best_score = score;
-            best_extended = extended;
-            stall = 0;
+    /* Collect the instances contributing to this extension (those whose
+     * end reaches near the edge being extended).  Same SLACK gating as
+     * the column-vote version. */
+    int max_insts = fam->num_instances;
+    if (max_insts == 0) return 0;
+    Instance *contrib = malloc((size_t)max_insts * sizeof(Instance));
+    if (!contrib) return 0;
+    int N = 0;
+    for (int j = 0; j < fam->num_instances; j++) {
+        Instance *inst = &fam->instances[j];
+        if (direction > 0) {
+            if (inst->cons_end < cons_len_at_start - EXTENSION_SLACK) continue;
         } else {
-            stall++;
+            if (inst->cons_start > EXTENSION_SLACK) continue;
         }
+        contrib[N++] = *inst;
+    }
+    if (N < 2) { free(contrib); return 0; }
 
-        if (stall >= ALIGN_WHEN_TO_STOP) break;
-
-        /* Cap penalty: hard stop if score drops too far below best */
-        if (score < best_score + ALIGN_CAPPENALTY) break;
+    /* Allocate score arrays: score[2][N][band_width] as flat block. */
+    int *score_block = malloc((size_t)2 * N * band_width * sizeof(int));
+    int **row0 = malloc((size_t)N * sizeof(int *));
+    int **row1 = malloc((size_t)N * sizeof(int *));
+    int *bestbest = malloc((size_t)N * sizeof(int));
+    char *ext_buf = malloc((size_t)max_ext);
+    if (!score_block || !row0 || !row1 || !bestbest || !ext_buf) {
+        free(score_block); free(row0); free(row1);
+        free(bestbest); free(ext_buf); free(contrib);
+        return 0;
+    }
+    for (int n = 0; n < N; n++) {
+        row0[n] = score_block + (0 * N + n) * band_width;
+        row1[n] = score_block + (1 * N + n) * band_width;
     }
 
-    /* Trim to best scoring position */
-    extended = best_extended;
+    ExtDP D;
+    D.N = N;
+    D.maxoffset = M;
+    D.band_width = band_width;
+    D.direction = direction;
+    D.cons_len = cons_len_at_start;
+    D.score[0] = row0;
+    D.score[1] = row1;
+    D.bestbestscore = bestbest;
+    D.insts = contrib;
+    D.genome = genome;
+
+    /* Initialize column "y = -1" (the imaginary anchor inside the
+     * existing consensus).  We seed all offsets to 0 so the DP has a
+     * neutral starting point — analogous to discover.c initialising
+     * from `l * MATCH` after l-mer seed.  Here we use 0 because no
+     * pre-extension match has been accumulated; the DP starts fresh. */
+    {
+        int prev = (-1) & 1;  /* equivalent to ((-1) % 2 + 2) % 2 = 1 */
+        for (int n = 0; n < N; n++) {
+            for (int o = 0; o < band_width; o++) {
+                int actual = o - M;
+                int gp_pen = 0;
+                if (actual < 0) gp_pen = -actual * g_align_gap;
+                if (actual > 0) gp_pen =  actual * g_align_gap;
+                D.score[prev][n][o] = gp_pen;  /* offset 0 = 0; off-band = neg */
+            }
+            bestbest[n] = 0;
+        }
+    }
+
+    int besty = -1;                /* best column index so far */
+    int besttotalbestscore = 0;
+    char besta = 0;
+
+    /* Main extension loop */
+    int y;
+    for (y = 0; y < max_ext; y++) {
+        int newtotalbestscore = 0;
+        int besta_local = 0;
+        int curr = y & 1;
+
+        /* For each candidate base, compute total best score */
+        for (char a = 0; a < 4; a++) {
+            int total_a = 0;
+            for (int n = 0; n < N; n++) {
+                int floor_score = bestbest[n] + ALIGN_CAPPENALTY;
+                if (floor_score < 0) floor_score = 0;
+                int bestscore_n = floor_score;
+                for (int off = -M; off <= M; off++) {
+                    int s = ext_compute_score(&D, y, n, off, a);
+                    if (s > bestscore_n) bestscore_n = s;
+                }
+                total_a += bestscore_n;
+            }
+            if (total_a > newtotalbestscore) {
+                newtotalbestscore = total_a;
+                besta_local = a;
+            }
+        }
+        besta = (char)besta_local;
+
+        /* Commit the chosen base: fill score[curr][n][*] for besta */
+        for (int n = 0; n < N; n++) {
+            for (int off = -M; off <= M; off++) {
+                D.score[curr][n][off + M] =
+                    ext_compute_score(&D, y, n, off, besta);
+            }
+        }
+
+        /* Update bestbestscore and totalbestscore (analogue of
+         * compute_totalbestscore_right minus the savebestscore /
+         * score_of_besty bookkeeping that's only needed for a
+         * subsequent left-extension hand-off). */
+        int totalbestscore = 0;
+        int nrepeatocc = 0;
+        for (int n = 0; n < N; n++) {
+            int floor_score = bestbest[n] + ALIGN_CAPPENALTY;
+            if (floor_score < 0) floor_score = 0;
+            int bs = floor_score;
+            for (int off = -M; off <= M; off++) {
+                if (D.score[curr][n][off + M] > bs)
+                    bs = D.score[curr][n][off + M];
+            }
+            if (bs > 0) nrepeatocc++;
+            if (bs > bestbest[n]) bestbest[n] = bs;
+            totalbestscore += bs;
+        }
+
+        ext_buf[y] = besta;
+
+        /* Segdup-prevention checks (carried from column-vote version):
+         * require minimum number of contributing instances as the
+         * extension grows long, so 2-3 identical copies can't drag the
+         * consensus along forever. */
+        if (nrepeatocc < 2) break;
+        if (y > 1000 && nrepeatocc < 3) break;
+        if (y > 5000 && nrepeatocc < 5) break;
+
+        /* Column-majority hard stop (mirror of HEAD column-vote).
+         * Without this, K's banded DP keeps extending on noise when N is
+         * large (e.g. N=27 post-merge): random background alignments in
+         * 5-6 of 27 instances are enough to keep nrepeatocc-pos and
+         * pick some besta, but no real majority exists. Result: 5 kb
+         * overshoot past true element boundary on synthetic ATHILA
+         * (V6_PHASE3_RESULT.md BIO-N2 failure).
+         *
+         * Count instances whose besta vote is strongly supported
+         * (per-instance best score with besta > floor_score by ≥ MATCH).
+         * If less than 50% of N support, this column is noise; break. */
+        int n_majority = 0;
+        for (int n = 0; n < N; n++) {
+            int floor_score = bestbest[n] + ALIGN_CAPPENALTY;
+            if (floor_score < 0) floor_score = 0;
+            for (int off = -M; off <= M; off++) {
+                if (D.score[curr][n][off + M] >= floor_score + ALIGN_MATCH) {
+                    n_majority++;
+                    break;
+                }
+            }
+        }
+        if (n_majority * 2 < N) break;
+
+        /* Score plateau / WHEN_TO_STOP termination */
+        if (totalbestscore > besttotalbestscore) {
+            besttotalbestscore = totalbestscore;
+            besty = y;
+        }
+        /* Adaptive WHEN_TO_STOP — long extensions earn a longer quiet
+         * window (mirrors discover.c::extend_right). */
+        int extended_so_far = besty + 1;
+        int adaptive_stop = ALIGN_WHEN_TO_STOP;
+        if (extended_so_far / 10 > adaptive_stop)
+            adaptive_stop = extended_so_far / 10;
+        if (y - besty >= adaptive_stop) break;
+    }
+
+    /* Trim to best position: extended = besty + 1 (besty is 0-based) */
+    extended = (besty >= 0) ? (besty + 1) : 0;
+
+    free(score_block);
+    free(row0);
+    free(row1);
+    free(bestbest);
+    free(contrib);
 
     if (extended == 0) {
         free(ext_buf);
@@ -935,4 +1282,239 @@ void align_refine_all(CandidateList *cl, const Genome *genome,
     if (verbose)
         fprintf(stderr, "  Alignment refinement: %d families refined, "
                 "%d lost all instances\n", refined, lost);
+}
+
+/* ================================================================
+ * Batch BLAST recruitment for short families
+ * ================================================================ */
+
+/*
+ * Add an Instance to a CandidateFamily, growing the array as needed.
+ * Returns 1 on success, 0 on allocation failure.
+ */
+static int family_add_instance(CandidateFamily *fam, const Instance *inst)
+{
+    if (fam->num_instances >= DEFAULT_MAXN) return 0;
+
+    if (!fam->instances) {
+        int cap = 64;
+        fam->instances = malloc((size_t)cap * sizeof(Instance));
+        if (!fam->instances) return 0;
+        fam->cap_instances = cap;
+        fam->num_instances = 0;
+    }
+
+    if (fam->num_instances >= fam->cap_instances) {
+        int new_cap = fam->cap_instances * 2;
+        if (new_cap > DEFAULT_MAXN) new_cap = DEFAULT_MAXN;
+        Instance *tmp = realloc(fam->instances,
+                                (size_t)new_cap * sizeof(Instance));
+        if (!tmp) return 0;
+        fam->instances = tmp;
+        fam->cap_instances = new_cap;
+    }
+
+    fam->instances[fam->num_instances++] = *inst;
+    return 1;
+}
+
+/*
+ * Check if a new instance overlaps an existing one by > 50% of the shorter.
+ */
+static int instance_overlaps_existing(const CandidateFamily *fam,
+                                       gpos_t genome_start, gpos_t genome_end)
+{
+    glen_t alen = genome_end - genome_start;
+    for (int j = 0; j < fam->num_instances; j++) {
+        const Instance *ex = &fam->instances[j];
+        gpos_t ex_end = ex->position + ex->aligned_length;
+        gpos_t ov_s = (genome_start > ex->position) ? genome_start : ex->position;
+        gpos_t ov_e = (genome_end   < ex_end)        ? genome_end   : ex_end;
+        if (ov_e > ov_s) {
+            glen_t ovl = ov_e - ov_s;
+            glen_t shorter = (alen < ex->aligned_length) ? alen : ex->aligned_length;
+            if (ovl > shorter / 2) return 1;
+        }
+    }
+    return 0;
+}
+
+int align_blast_recruit_short_families(CandidateList *cl,
+                                        const Genome *genome, int k,
+                                        int verbose)
+{
+    if (!blastn_available()) return -1;
+
+    /* Identify families with consensus_length < BLAST_SHORT_THRESHOLD */
+    int n_short = 0;
+    for (int i = 0; i < cl->num_families; i++) {
+        CandidateFamily *f = &cl->families[i];
+        if (f->consensus && f->consensus_length < BLAST_SHORT_THRESHOLD
+                         && f->consensus_length >= k)
+            n_short++;
+    }
+    if (n_short == 0) return 0;
+
+    if (verbose)
+        fprintf(stderr, "  BLAST recruitment: %d short families (<%d bp) — "
+                "running batch dc-megablast...\n",
+                n_short, BLAST_SHORT_THRESHOLD);
+
+    /* Build temp file paths */
+    int pid = (int)getpid();
+    char query_fa[256], subj_fa[256], out_tab[256];
+    snprintf(query_fa, sizeof(query_fa), "/tmp/mdlr_batch_q_%d.fa",  pid);
+    snprintf(subj_fa,  sizeof(subj_fa),  "/tmp/mdlr_batch_s_%d.fa",  pid);
+    snprintf(out_tab,  sizeof(out_tab),  "/tmp/mdlr_batch_o_%d.tab", pid);
+
+    /* Map from genome sequence names to raw start offsets */
+    int nseq = genome->num_sequences;
+    if (nseq < 1) return -1;
+    gpos_t *seq_raw_starts = malloc((size_t)nseq * sizeof(gpos_t));
+    if (!seq_raw_starts) return -1;
+
+    int rc = -1;
+
+    /* Write genome subject FASTA */
+    if (write_genome_fasta(genome, subj_fa, seq_raw_starts, nseq) != 0)
+        goto cleanup;
+
+    /* Write multi-FASTA query: one record per short family.
+     * Header format: >F<family_index>  (e.g., ">F42") */
+    {
+        FILE *fp = fopen(query_fa, "w");
+        if (!fp) goto cleanup;
+        for (int i = 0; i < cl->num_families; i++) {
+            CandidateFamily *f = &cl->families[i];
+            if (!f->consensus || f->consensus_length < k
+                               || f->consensus_length >= BLAST_SHORT_THRESHOLD)
+                continue;
+            fprintf(fp, ">F%d\n", i);
+            for (int j = 0; j < f->consensus_length; j++) {
+                fputc(num_to_char(f->consensus[j]), fp);
+                if ((j + 1) % 80 == 0) fputc('\n', fp);
+            }
+            if (f->consensus_length % 80 != 0) fputc('\n', fp);
+        }
+        fclose(fp);
+    }
+
+    /* Run single blastn for all short families */
+    {
+        char cmd[2048];
+        snprintf(cmd, sizeof(cmd),
+                 "%s -task dc-megablast -query %s -subject %s "
+                 "-outfmt \"6 qseqid sseqid sstart send pident length "
+                 "qstart qend evalue sstrand\" "
+                 "-perc_identity %.1f -dust no "
+                 "-out %s 2>/dev/null",
+                 g_blastn_path, query_fa, subj_fa,
+                 (double)BLAST_MIN_PIDENT,
+                 out_tab);
+        system(cmd);  /* non-zero exit = no hits, not a hard error */
+    }
+
+    /* Parse BLAST output and distribute hits to families */
+    FILE *fp = fopen(out_tab, "r");
+    if (!fp) { rc = 0; goto cleanup; }
+
+    char line[1024];
+    int total_added = 0;
+
+    while (fgets(line, sizeof(line), fp)) {
+        /* Fields: qseqid sseqid sstart send pident length qstart qend evalue sstrand */
+        char qseqid[64], sseqid[256], sstrand_str[16];
+        long long sstart, send, qstart, qend, length;
+        double pident, evalue;
+
+        if (sscanf(line, "%63s %255s %lld %lld %lf %lld %lld %lld %lf %15s",
+                   qseqid, sseqid, &sstart, &send, &pident, &length,
+                   &qstart, &qend, &evalue, sstrand_str) != 10)
+            continue;
+
+        /* Parse family index from qseqid "F<idx>" */
+        if (qseqid[0] != 'F') continue;
+        int fam_idx = atoi(qseqid + 1);
+        if (fam_idx < 0 || fam_idx >= cl->num_families) continue;
+
+        CandidateFamily *fam = &cl->families[fam_idx];
+        if (!fam->consensus) continue;
+
+        /* Filters */
+        if (pident < (double)BLAST_MIN_PIDENT) continue;
+        if (length < (long long)k) continue;
+
+        /* Strand */
+        int8_t strand = (strcmp(sstrand_str, "minus") == 0) ? -1 : +1;
+
+        /* Find genome sequence */
+        int seq_idx = -1;
+        for (int i = 0; i < nseq; i++) {
+            const char *seqid = (genome->sequence_ids && genome->sequence_ids[i])
+                                ? genome->sequence_ids[i] : "seq";
+            if (strcmp(seqid, sseqid) == 0) { seq_idx = i; break; }
+        }
+        if (seq_idx < 0) continue;
+
+        /* Convert BLAST coords → padded internal coords */
+        gpos_t raw_start, raw_end;
+        if (strand > 0) {
+            raw_start = seq_raw_starts[seq_idx] + (sstart - 1);
+            raw_end   = seq_raw_starts[seq_idx] + send;
+        } else {
+            raw_start = seq_raw_starts[seq_idx] + (send - 1);
+            raw_end   = seq_raw_starts[seq_idx] + sstart;
+        }
+        gpos_t genome_start = raw_start + PADLENGTH;
+        gpos_t genome_end   = raw_end   + PADLENGTH;
+        glen_t alen         = genome_end - genome_start;
+
+        /* Validate */
+        if (genome_start < PADLENGTH) continue;
+        if (genome_end > genome->length) continue;
+        if (alen < (glen_t)k) continue;
+        if (!genome_check_boundary(genome, genome_start, alen)) continue;
+
+        /* Consensus coords: qstart/qend are 1-based in query (always forward) */
+        int cons_start = (int)(qstart - 1);
+        int cons_end   = (int)qend;
+        if (cons_start < 0) cons_start = 0;
+        if (cons_end > fam->consensus_length) cons_end = fam->consensus_length;
+        if (cons_end <= cons_start) continue;
+
+        float div = (float)((100.0 - pident) / 100.0);
+        if (div > g_align_max_divergence) continue;
+
+        /* Skip if overlapping existing instance */
+        if (instance_overlaps_existing(fam, genome_start, genome_end)) continue;
+
+        Instance inst;
+        inst.position       = genome_start;
+        inst.aligned_length = alen;
+        inst.cons_start     = cons_start;
+        inst.cons_end       = cons_end;
+        inst.num_edits      = (int)(div * (float)length + 0.5f);
+        inst.divergence     = div;
+        inst.score          = (int)(pident / 100.0 * (double)length);
+        if (inst.score < 1) inst.score = 1;
+        inst.strand         = strand;
+        inst.seq_index      = genome_get_seq_index(genome, genome_start);
+
+        if (family_add_instance(fam, &inst))
+            total_added++;
+    }
+
+    fclose(fp);
+    rc = total_added;
+
+    if (verbose)
+        fprintf(stderr, "  BLAST recruitment: added %d instances across %d families\n",
+                total_added, n_short);
+
+cleanup:
+    free(seq_raw_starts);
+    remove(query_fa);
+    remove(subj_fa);
+    remove(out_tab);
+    return rc;
 }

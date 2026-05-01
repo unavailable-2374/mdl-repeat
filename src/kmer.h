@@ -46,8 +46,9 @@ uint64_t kmer_canonical(uint64_t kmer, int k);
 /* --- Hash table operations --- */
 
 /* Count all k-mers in genome with TANDEMDIST filtering.
+ * num_threads > 1 enables parallel counting with striped locks.
  * Returns a new KmerTable, or NULL on failure. */
-KmerTable *kmer_count(const Genome *g, int k, int tandemdist);
+KmerTable *kmer_count(const Genome *g, int k, int tandemdist, int num_threads);
 
 /* Remove entries with frequency < min_freq. Returns number removed. */
 int64_t kmer_trim(KmerTable *kt, freq_t min_freq);

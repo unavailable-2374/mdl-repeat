@@ -19,13 +19,33 @@
 #define REFINE_RELAXED_IDENTITY 0.70f
 #define REFINE_RELAXED_COVERAGE 0.70f
 
-/* Consensus-vs-consensus alignment scoring */
+/*
+ * Consensus-vs-consensus alignment scoring (used ONLY by the merge stage
+ * to decide whether two candidate families represent the same biological
+ * repeat — this is a binary "same family?" decision).
+ *
+ * SCOPE BOUNDARY (M2#7): These constants do NOT feed into MDL.  The
+ * per-instance edit count m_i that mdl.c consumes comes from
+ * align_collect_instances() in align.c, which uses ALIGN_MATCH /
+ * ALIGN_MISMATCH / g_align_gap (1 / -1 / -5).  The two scoring systems
+ * are deliberately decoupled:
+ *
+ *   - align.c  (1 / -1 / -5): instance-vs-consensus banded DP, produces
+ *                              num_edits — the substrate for MDL scoring.
+ *   - refine.c (2 / -3 / -2): consensus-vs-consensus semi-global DP,
+ *                              produces only an identity/coverage % for
+ *                              the 80-80-80 same-family threshold.
+ *                              More aggressive match preference because
+ *                              the decision is binary and the alignment
+ *                              is short relative to consensi.
+ */
 #define REFINE_MATCH    2
 #define REFINE_MISMATCH -3
 #define REFINE_GAP      -2
 
-/* Max DP matrix cells to prevent memory/time blowup on long consensus pairs */
-#define REFINE_MAX_DP_CELLS  (10 * 1000 * 1000)  /* 10M cells ~40MB */
+/* Runtime-configurable: max DP matrix cells (default 10M ~40MB).
+ * Increase to 50M for long TE families (ERV, Helitron). */
+extern int64_t g_refine_max_dp_cells;
 
 /* Splitting parameters */
 #define REFINE_MIN_SPLIT_INSTANCES  10   /* minimum instances to attempt split */
@@ -54,7 +74,7 @@ int refine_merge_families(CandidateList *cl, const Genome *genome,
 int refine_split_families(CandidateList *cl, const Genome *genome,
                           const KmerTable *kt, int k,
                           glen_t genome_len, int verbose,
-                          int num_families);
+                          int num_families, int num_threads);
 
 /*
  * Prune marginal families after MDL selection.
@@ -77,5 +97,29 @@ int refine_assemble_fragments(CandidateList *cl, const Genome *genome,
                               const KmerTable *kt, int k,
                               glen_t genome_len, int verbose,
                               int num_threads);
+
+/*
+ * Coalesce same-family tandem-array instances into single longer instances.
+ *
+ * Background: RM-style ground-truth annotations merge directly-adjacent
+ * repeat copies into one long interval (e.g. a 6×1.6 kb tandem array is
+ * reported as one 9.6 kb truth interval).  mdl-repeat naturally outputs
+ * each copy as a separate instance, which produces a fragment-versus-truth
+ * mismatch that drives apparent recall down.
+ *
+ * This pass walks each accepted family's instance list and merges
+ * consecutive instances on the same strand whose gap is less than
+ * coalesce_factor × consensus_length (default 1.5).  num_edits and
+ * divergence are summed/averaged proportionally; aligned_length grows.
+ *
+ * Net effect on reporting: long tandem arrays become single long
+ * instances that match the truth annotation convention.  No effect on
+ * MDL scoring (already done before this pass).
+ *
+ * Returns: number of instance pairs coalesced.
+ */
+int refine_coalesce_tandem_instances(CandidateList *cl,
+                                     float coalesce_factor,
+                                     int verbose);
 
 #endif /* MDL_REFINE_H */
