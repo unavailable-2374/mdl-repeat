@@ -16,9 +16,10 @@
 5. [K-mer Table and Position Index](#5-k-mer-table-and-position-index)
 6. [Refinement Pipeline](#6-refinement-pipeline)
 7. [MDL Scoring and Library Selection](#7-mdl-scoring-and-library-selection)
-8. [Output Formats](#8-output-formats)
-9. [Key Design Decisions](#9-key-design-decisions)
-10. [Parameters Reference](#10-parameters-reference)
+8. [Large Genome Support](#8-large-genome-support)
+9. [Output Formats](#9-output-formats)
+10. [Key Design Decisions](#10-key-design-decisions)
+11. [Parameters Reference](#11-parameters-reference)
 
 ---
 
@@ -34,7 +35,8 @@ mdl-repeat uses the **Minimum Description Length (MDL) principle** as a unified,
 - **MDL-based model selection** — a family is accepted if and only if encoding its instances as references to the consensus compresses the genome
 - **Iterative R convergence** — resolves the circular dependency between the number of accepted families and per-instance encoding costs
 - **Refinement pipeline** — merge, split, fragment assembly, and prune stages to improve library quality
-- **Multi-threading** — parallel position index construction and alignment refinement
+- **Multi-threading** — parallel position index construction, alignment refinement, and chunked discovery
+- **Large genome support** — genome sampling and chunked parallel discovery for multi-gigabase genomes
 
 ### 1.2 System Requirements
 
@@ -134,9 +136,17 @@ Input: genome.fa
 Step 1: Load genome
     → Genome struct with padded sequence, boundary array, sequence IDs
 
+Step 1b: Sample genome (if genome > sample_size, default 1 Gb)
+    → Tile-based random sampling to reduce genome to manageable size
+    → Save segment mapping for coordinate remapping
+
 Step 2: Discover consensus families (seed-and-extend)
+    → If genome > chunk_size (default 200 Mb): chunked parallel discovery
+       - Segment sequences with overlap at split points
+       - LPT bin packing for balanced parallel load
+       - Per-chunk l-mer length (more sensitive than full-genome l)
+    → Otherwise: single-pass discovery
     → CandidateList with consensus sequences and instances
-    → Optionally reads/writes l-mer frequency table
 
 Step 3: Build k-mer table + position index
     → KmerTable for refinement pipeline lookups
@@ -162,7 +172,12 @@ Step 8: Prune marginal families
 Step 8b: Post-prune recovery pass
     → Re-score rejected families with reduced R
 
+Step 8c: Tandem-instance coalescing (controlled by -coalesce-factor)
+    → Merges adjacent same-family same-strand instances within
+      coalesce_factor bases; 0 disables; default 20.0
+
 Step 9: Output
+    → If sampled: remap instance coordinates to original genome
     → FASTA library, optional BED instances, optional TSV statistics
 ```
 
@@ -170,7 +185,9 @@ Step 9: Output
 
 ## 4. Discovery Engine
 
-The discovery engine (`discover.c`, ~2200 lines) implements the seed-and-extend paradigm: select the highest-frequency l-mer as a seed, extend it into a consensus via simultaneous banded DP alignment against all occurrences, mask the found family, and repeat.
+The discovery engine (`discover.c`, ~2000 lines) implements the seed-and-extend paradigm: select the highest-frequency l-mer as a seed, extend it into a consensus via simultaneous banded DP alignment against all occurrences, mask the found family, and repeat.
+
+All mutable state is encapsulated in a heap-allocated `DiscoverContext` struct, making `discover_families()` thread-safe and reentrant. This enables parallel chunked discovery where multiple independent calls run concurrently on different genome segments. The context holds: algorithm parameters, genome data (doubled sequence, masking array, boundaries), extension workspace (consensus buffers, occurrence arrays), and DP scoring arrays (`score[2][MAXN][2*MAXOFFSET+1]`). All internal functions take `DiscoverContext *C` as their first parameter. Position and length variables use `gpos_t`/`glen_t` (int64_t) throughout to support multi-gigabase genomes.
 
 ### 4.1 Genome Doubling
 
@@ -288,7 +305,7 @@ After counting, `kmer_build_positions` constructs a position array for each k-me
 
 ## 6. Refinement Pipeline
 
-The refinement pipeline (`refine.c`, ~1800 lines) improves the raw discovery output through four stages.
+The refinement pipeline (`refine.c`, ~2200 lines) improves the raw discovery output through four stages.
 
 ### 6.1 Merge: 80-80-80 Rule
 
@@ -424,9 +441,73 @@ After pruning reduces $R$, the per-instance overhead decreases (e.g., $\lceil \l
 
 ---
 
-## 8. Output Formats
+## 8. Large Genome Support
 
-### 8.1 FASTA Library
+For multi-gigabase genomes (e.g., human, lungfish, axolotl), mdl-repeat provides two complementary scaling mechanisms: genome sampling and chunked discovery. These activate automatically based on genome size but can be tuned via CLI parameters.
+
+### 8.1 Genome Sampling
+
+**Activation**: when `genome_length > sample_size` (default: 1 Gb, CLI: `-sample-size`).
+
+The genome is reduced to a representative sample before any discovery takes place. This makes the tool practical for very large genomes (10+ Gb) where full-genome discovery would be prohibitively expensive.
+
+**Tile-based random sampling**:
+
+1. Divide each sequence into non-overlapping tiles of size `window_size` (default: 1 Mb, CLI: `-window-size`)
+2. Compute target window count: `num_windows = floor(sample_size / window_size)`
+3. Select `num_windows` tiles from the total pool via partial Fisher-Yates shuffle with a deterministic seed (CLI: `-seed`, default: 42)
+4. Sort selected tiles by genomic coordinate for sequential memory access
+5. Create a sampled genome from the selected tiles
+
+The original genome's sequence data is freed after sampling to reclaim memory; only metadata (boundaries, sequence IDs) is retained for BED coordinate output.
+
+**Coordinate remapping**: After discovery completes on the sampled genome, instance coordinates are remapped back to the original genome before BED output. For each instance, a binary search identifies which sampled segment it belongs to, and the offset within that segment is added to the segment's original genomic position.
+
+The sampled genome can be written to FASTA for reproducibility via `-sample-output <file>`.
+
+### 8.2 Chunked Discovery
+
+**Activation**: when `genome_length > chunk_size` (default: 200 Mb, CLI: `-chunk-size`).
+
+When the (possibly sampled) genome exceeds the chunk size, discovery is split into independent parallel chunks rather than running as a single pass.
+
+**Sequence segmentation**:
+
+1. Sequences shorter than `1.8 × chunk_size` become a single segment
+2. Longer sequences are recursively halved (power-of-2 splitting) until each part is below the split threshold
+3. Adjacent segments overlap by `L` bases (default: 10,000, the max extension distance) to avoid missing repeats at split boundaries
+
+**LPT bin packing**:
+
+1. Sort all segments by length (descending)
+2. Compute number of bins: `ceil(total_segment_size / chunk_size)`, bounded by `[2, num_segments]`
+3. Assign each segment (largest first) to the bin with the smallest current total — Longest Processing Time (LPT) scheduling minimizes the maximum bin size for balanced parallel wall-clock time
+
+**Parallel execution**:
+
+1. Process bins in batches of `min(num_bins, num_threads)`
+2. Each worker thread creates a chunk genome via `genome_create_chunk()` (copies sequence data, shares sequence ID strings)
+3. Each chunk independently calls `discover_families()` with its own `DiscoverContext`, computing a per-chunk l-mer length (more sensitive than the full-genome l)
+4. Results from all chunks are concatenated into a single `CandidateList` with renumbered family IDs
+
+**Design rationale**: Chunked discovery improves both memory efficiency and sensitivity. Smaller chunks allow a shorter l-mer length (since l = ceil(1 + log4(N))), which increases seed sensitivity for lower-copy families. The overlap at split boundaries ensures that repeats straddling chunk boundaries are still discoverable.
+
+### 8.3 Integration
+
+The two mechanisms compose naturally:
+
+1. **Sampling** (if triggered): reduces a 10+ Gb genome to ~1 Gb
+2. **Chunked discovery** (if triggered): splits the ~1 Gb genome into ~200 Mb parallel chunks
+3. **Refinement**: runs on the full sampled genome (not per-chunk)
+4. **Output**: coordinates remapped to original genome if sampling was used
+
+For small genomes (< chunk_size), no splitting occurs and discovery runs single-threaded as before.
+
+---
+
+## 9. Output Formats
+
+### 9.1 FASTA Library
 
 The primary output. Only families with `mdl_score > 0` are written.
 
@@ -441,7 +522,7 @@ Header fields:
 - `copies=<n>`: number of instances
 - `mdl=<score>`: MDL score (bits saved)
 
-### 8.2 BED Instances (`-instances`)
+### 9.2 BED Instances (`-instances`)
 
 One line per instance of each accepted family:
 
@@ -453,7 +534,7 @@ chr1    10000    10312    R=42    850    +
 - Column 5: `int(1000 * (1 - divergence))` (0-1000 scale)
 - Column 6: strand
 
-### 8.3 TSV Statistics (`-stats`)
+### 9.3 TSV Statistics (`-stats`)
 
 Per-family statistics for all accepted families:
 
@@ -463,13 +544,13 @@ family_id    consensus_length    num_instances    divergence_mean    mdl_score  
 
 ---
 
-## 9. Key Design Decisions
+## 10. Key Design Decisions
 
-### 9.1 Genome Doubling vs. Separate Strand Processing
+### 10.1 Genome Doubling vs. Separate Strand Processing
 
 mdl-repeat uses genome doubling (forward + padding + reverse complement), matching RepeatScout's `add_rc()`. This approximately doubles the number of occurrences available for simultaneous DP extension, providing stronger statistical evidence for each consensus position. The alternative (processing strands separately) was found to produce significantly lower sensitivity.
 
-### 9.2 Sensitivity-Preserving MDL Formula
+### 10.2 Sensitivity-Preserving MDL Formula
 
 A theoretically complete per-instance encoding would include type bit (1 bit), family identifier ($\lceil \log_2(R) \rceil$ bits), strand (1 bit), and consensus start pointer ($\lceil \log_2(\text{len}_r) \rceil$ bits) — totaling approximately 19-24 additional bits per instance. However, testing on real genomes showed that this level of overhead caused unacceptable sensitivity loss, rejecting genuine low-copy families.
 
@@ -481,19 +562,19 @@ The `mdl_instance_cost_full()` function accepts `consensus_length` and `num_fami
 
 **Design principle**: The MDL formula prioritizes sensitivity over theoretical completeness. It is better to accept a few marginal families than to miss genuine repeats.
 
-### 9.3 Spatial Co-occurrence for Fragment Assembly
+### 10.3 Spatial Co-occurrence for Fragment Assembly
 
 The original plan proposed k-mer Jaccard for detecting fragment pairs. This is fundamentally wrong for fragment assembly: non-overlapping fragments from different parts of the same TE share zero k-mers. The correct approach is **spatial co-occurrence** — counting how often instances from two families appear near each other in the genome. This was identified during plan review and implemented from the start.
 
-### 9.4 Discovery vs. Refinement Alignment
+### 10.4 Discovery vs. Refinement Alignment
 
 The discovery engine and the refinement pipeline use different alignment strategies. The discovery engine uses N-sequence simultaneous banded DP, which produces consensus sequences from approximate alignment across all occurrences. The refinement pipeline uses multi-k-mer seeded alignment, which anchors on exact k-mer matches. These two approaches are complementary: the discovery alignment is better for building initial consensus from noisy data, while the seeded alignment is better for collecting instances against an established consensus. Applying seeded alignment to raw discovery output would truncate the consensus and lose coverage.
 
-### 9.5 Default MINTHRESH=2
+### 10.5 Default MINTHRESH=2
 
 mdl-repeat defaults to MINTHRESH=2 (minimum l-mer frequency to seed). Since MDL is the final arbiter, allowing seeds with frequency 2 lets MDL evaluate borderline families rather than discarding them a priori. This improves sensitivity for low-copy families that genuinely compress the genome.
 
-### 9.6 Canonical K-mers
+### 10.6 Canonical K-mers
 
 Both the discovery hash table and the refinement k-mer table use symmetric/canonical representations:
 - Discovery: `max(hash_forward, hash_revcomp)` ensures forward and RC l-mers collide
@@ -503,16 +584,16 @@ This halves the table size and ensures that a repeat family is discovered regard
 
 ---
 
-## 10. Parameters Reference
+## 11. Parameters Reference
 
-### 10.1 Required Arguments
+### 11.1 Required Arguments
 
 | Argument | Description |
 |----------|-------------|
 | `-sequence <file>` | Input FASTA genome file |
 | `-output <file>` | Output repeat library (FASTA) |
 
-### 10.2 Discovery Parameters
+### 11.2 Discovery Parameters
 
 | Argument | Default | Description |
 |----------|---------|-------------|
@@ -534,14 +615,28 @@ This halves the table size and ensures that a repeat family is discovered regard
 | `-maxoccurrences <int>` | 10000 | Max occurrences per seed |
 | `-maxrepeats <int>` | 100000 | Max families to discover |
 
-### 10.3 Refinement Parameters
+### 11.3 Refinement Parameters
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `-threads <int>` | 1 | Number of threads for refinement |
+| `-threads <int>` | 1 | Number of threads for refinement and chunked discovery |
 | `-mdl-mode <mode>` | exact | MDL position encoding: `none`, `exact`, or `upper` |
+| `-max-divergence <float>` | 0.30 | Max substitution rate for instance acceptance (0.0–1.0) |
+| `-refine-gap <int>` | -5 | Refinement gap penalty (recommended -3 for high-indel species) |
+| `-refine-maxoffset <int>` | 12 | Refinement DP band half-width (1–32) |
+| `-max-dp-cells <int>` | 10000000 | Max DP cells for consensus merge (~40 MB) |
 
-### 10.4 Output Parameters
+### 11.4 Large Genome Parameters
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `-chunk-size <int>` | 200 | Chunk size in Mb for parallel discovery (min: 10) |
+| `-sample-size <int>` | 1000 | Genome sampling threshold in Mb (min: 100) |
+| `-window-size <int>` | 1000 | Sampling tile size in kb (100–10000) |
+| `-seed <int>` | 42 | Random seed for reproducible sampling |
+| `-sample-output <file>` | — | Write sampled genome FASTA for reproducibility |
+
+### 11.5 Output Parameters
 
 | Argument | Default | Description |
 |----------|---------|-------------|
@@ -549,20 +644,28 @@ This halves the table size and ensures that a repeat family is discovered regard
 | `-stats <file>` | — | Output family statistics TSV |
 | `-v` / `-vv` | off | Verbosity level (1 or 2) |
 
-### 10.5 Internal Constants
+### 11.6 Internal Constants
 
 | Constant | Value | Location | Description |
 |----------|-------|----------|-------------|
 | `PADLENGTH` | 11000 | types.h | Genome padding (must be >= L) |
 | `HASH_SIZE` | 16000057 | discover.c | Discovery hash table size (prime) |
 | `KMER_MAX_POSITIONS` | 50000 | kmer.h | Max positions stored per k-mer |
-| `ALIGN_MAXOFFSET` | 12 | align.h | Refinement DP band width (±12) |
+| `g_align_maxoffset` | 12 | align.c | Refinement DP band half-width (CLI: `-refine-maxoffset`) |
+| `g_align_gap` | -5 | align.c | Refinement gap penalty (CLI: `-refine-gap`) |
+| `g_align_max_divergence` | 0.30 | align.c | Max substitution rate (CLI: `-max-divergence`) |
 | `REFINE_MIN_JACCARD` | 0.15 | refine.h | K-mer screening threshold for merge |
 | `REFINE_MIN_IDENTITY` | 0.80 | refine.h | Merge identity threshold |
 | `REFINE_MIN_COVERAGE` | 0.80 | refine.h | Merge coverage threshold |
 | `REFINE_MIN_ALIGNED` | 80 | refine.h | Merge min aligned bases |
 | `REFINE_BIMODALITY_THRESH` | 0.20 | refine.h | Split bimodality threshold |
-| `REFINE_MAX_DP_CELLS` | 10M | refine.h | Max DP matrix size for alignment |
+| `g_refine_max_dp_cells` | 10M | refine.c | Max DP cells for consensus merge (CLI: `-max-dp-cells`) |
+| `ALIGN_MAXOFFSET_LIMIT` | 32 | align.h | Maximum allowed `-refine-maxoffset` value |
+| `ALIGN_MAX_ITERATIONS` | 10 | align.h | Max convergence iterations per family |
+| `MAX_SEED_HITS` | 50000 | align.c | Cap per-family seed hits |
+| `NUM_STRIPES` | 4096 | kmer.c | Lock striping for parallel k-mer counting |
+| `POOL_BLOCK_SIZE` | 4096 | kmer.c | KmerEntry memory pool block size |
+| `DISCOVER_SPLIT_THRESHOLD` | 200M | main.c | Default chunk size for chunked discovery |
 
 ---
 

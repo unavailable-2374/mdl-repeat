@@ -10,7 +10,8 @@ mdl-repeat identifies repetitive element families in genomic DNA sequences witho
 - **Seed-and-extend discovery** — high-frequency l-mer seeds are extended into consensus sequences via N-sequence simultaneous banded DP alignment
 - **Refinement pipeline** — merge redundant families (80-80-80 rule), split bimodal divergence (Otsu's method), assemble TE fragments (spatial co-occurrence), prune marginal families (exclusive coverage test)
 - **Three MDL encoding modes** — `exact` (lgamma binomial, default), `upper` (conservative bound), `none`
-- **Multi-threading** — parallel k-mer position index construction and alignment refinement
+- **Multi-threading** — parallel k-mer position index construction, alignment refinement, and chunked discovery
+- **Large genome support** — genome sampling (tile-based Fisher-Yates) and chunked parallel discovery with LPT bin packing for multi-gigabase genomes
 - **Frequency table reuse** — save/load l-mer frequency tables to skip recomputation across runs
 
 ## Requirements
@@ -18,7 +19,15 @@ mdl-repeat identifies repetitive element families in genomic DNA sequences witho
 - GCC (C11 standard)
 - GNU Make
 - Linux/POSIX
-- No external libraries (only `libm` and pthreads)
+- No external libraries at build time (only `libm` and pthreads)
+
+**Optional runtime dependency:**
+- `blastn` (BLAST+ ≥ 2.12) — for BLAST-based instance recruitment of short
+  families (consensus length < 500 bp). When present in PATH or at
+  `/home/shuoc/tool/miniconda3/envs/PGTA/bin/blastn`, `dc-megablast` is used
+  for improved sensitivity on short divergent elements. Falls back to the
+  built-in k-mer + banded DP path if blastn is not found. Install via:
+  `conda install -c bioconda blast` or `apt install ncbi-blast+`.
 
 ## Build
 
@@ -44,6 +53,15 @@ make clean          # Remove build artifacts
     -instances instances.bed \
     -stats stats.tsv \
     -threads 4 -vv
+
+# Large genome (auto-samples if > 1 Gb, auto-chunks if > 200 Mb)
+./bin/mdl-repeat -sequence human.fa -output families.fa \
+    -threads 8 -chunk-size 200 -sample-size 1000 -v
+
+# Very large genome with custom sampling
+./bin/mdl-repeat -sequence axolotl.fa -output families.fa \
+    -threads 16 -sample-size 2000 -window-size 500 -seed 123 \
+    -sample-output sampled.fa -v
 ```
 
 ## Usage
@@ -75,8 +93,21 @@ Discovery:
   -maxrepeats #      Max families to discover (default: 100000)
 
 Refinement:
-  -threads #         Number of threads (default: 1)
-  -mdl-mode <mode>   MDL position encoding: none|exact|upper (default: exact)
+  -threads #              Number of threads (default: 1)
+  -mdl-mode <mode>        MDL position encoding: none|exact|upper (default: exact)
+  -max-divergence #       Max substitution rate (default: 0.30)
+  -refine-gap #           Refinement gap penalty (default: -5, try -3 for high-indel)
+  -refine-maxoffset #     Refinement DP band half-width (default: 12, max: 32)
+  -max-dp-cells #         Max DP cells for merge alignment (default: 10000000)
+  -coalesce-factor #      Gap tolerance for tandem-instance coalescing in bases
+                          (default: 20.0; 0 = disabled)
+
+Large genome:
+  -chunk-size #           Chunk size in Mb for parallel discovery (default: 200)
+  -sample-size #          Sampling threshold in Mb (default: 1000)
+  -window-size #          Sampling tile size in kb (default: 1000)
+  -seed #                 Random seed for sampling (default: 42)
+  -sample-output <file>   Write sampled genome FASTA
 
 Output:
   -instances <file>  Instance locations (BED6)
@@ -93,10 +124,14 @@ Input FASTA
 1. Load genome
     |
     v
+1b. Sample genome (if > sample_size, default 1 Gb)
+    - Tile-based Fisher-Yates random sampling
+    |
+    v
 2. Discover consensus families
-   - Build or read l-mer frequency table
-   - Extend high-frequency seeds via N-sequence simultaneous banded DP
-   - Mask found families to prevent rediscovery
+   - If > chunk_size (default 200 Mb): chunked parallel discovery
+     with LPT bin packing and overlapping segments
+   - Otherwise: single-pass seed-and-extend discovery
     |
     v
 3. Build k-mer table and position index
@@ -123,7 +158,8 @@ Input FASTA
 10. Recovery pass (re-score rejected families with reduced R)
     |
     v
-Output: FASTA library + BED instances + TSV statistics
+11. Output (remap coordinates if sampled)
+    → FASTA library + BED instances + TSV statistics
 ```
 
 ## How It Works
@@ -161,6 +197,15 @@ The default l-mer length is `ceil(1 + log4(N))` where N is the genome length.
 - **Prune**: Removes accepted families whose exclusive genome coverage (positions not covered by any other family) does not justify their model cost.
 - **Recovery**: After pruning reduces R, the per-instance overhead decreases, which may cause previously rejected families to become viable. A recovery pass re-scores all rejected families with the final R.
 
+### Large Genome Support
+
+For multi-gigabase genomes, two scaling mechanisms activate automatically:
+
+- **Genome sampling** (genome > 1 Gb): The genome is reduced to a representative sample via tile-based random selection (1 Mb non-overlapping tiles, Fisher-Yates shuffle). Instance coordinates are remapped to the original genome after discovery. Controlled via `-sample-size`, `-window-size`, `-seed`.
+- **Chunked discovery** (genome > 200 Mb): Long sequences are segmented with overlap at boundaries, packed into balanced bins via LPT scheduling, and processed in parallel. Each chunk computes its own l-mer length for increased sensitivity. Controlled via `-chunk-size`.
+
+All position and length variables use 64-bit integers (`gpos_t`/`glen_t`) to avoid overflow on large genomes.
+
 ## Output Formats
 
 **FASTA** (`-output`): Consensus sequences for accepted repeat families.
@@ -184,12 +229,12 @@ Column 5 is `1000 * (1 - divergence)` on a 0-1000 scale.
 
 ```
 src/
-├── main.c              Pipeline driver, CLI parsing
-├── types.h             Core types (gpos_t, glen_t, DNA encoding, constants)
+├── main.c              Pipeline driver, CLI parsing, chunked discovery, genome sampling
+├── types.h             Core types (gpos_t/glen_t as int64_t, DNA encoding, constants)
 ├── genome.c/.h         FASTA loading, padding, boundary tracking
-├── kmer.c/.h           Canonical k-mer counting, hash table, position index
-├── discover.c/.h       Seed-and-extend discovery engine
-├── align.c/.h          Multi-k-mer seeding, banded DP alignment, consensus rebuild
+├── kmer.c/.h           Canonical k-mer counting, striped-lock parallel hash table, position index
+├── discover.c/.h       Seed-and-extend discovery engine (thread-safe DiscoverContext)
+├── align.c/.h          Multi-k-mer seeding, banded DP alignment, consensus rebuild/extend
 ├── candidates.c/.h     CandidateFamily/Instance structures, memory management
 ├── refine.c/.h         Merge, split, fragment assembly, prune
 ├── mdl.c/.h            Rissanen's universal integer code, MDL scoring, library selection
@@ -197,7 +242,7 @@ src/
 └── cmd_line_opts.c/.h  Argument parsing
 ```
 
-~6,000 lines of C. No external dependencies.
+~8,300 lines of C. No external dependencies.
 
 ## Testing
 
