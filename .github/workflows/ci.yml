@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [native, portable]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+      - name: Build (native)
+        if: matrix.mode == 'native'
+        run: make
+      - name: Build (portable)
+        if: matrix.mode == 'portable'
+        run: make PORTABLE=1
+      - name: Show binary
+        run: ls -lh bin/
+
+  test-suite:
+    name: Test suite (mdl + integration)
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential python3
+      - name: Build PORTABLE (CI runner CPUs vary)
+        run: make PORTABLE=1
+      - name: Run test suite
+        run: bash tests/run_tests.sh
+
+  valgrind:
+    name: Valgrind smoke (testA)
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential python3 valgrind
+      - name: Build PORTABLE without LTO for valgrind clarity
+        run: |
+          # LTO can confuse valgrind line numbers; keep -O2 for speed
+          make PORTABLE=1
+      - name: Generate testA fixture if missing
+        run: |
+          mkdir -p tests/data
+          [ -f tests/data/testA.fa ] || python3 tests/gen_synthetic.py -o tests/data
+      - name: Run valgrind
+        run: |
+          valgrind --error-exitcode=1 --leak-check=full --errors-for-leak-kinds=definite \
+            ./bin/mdl-repeat \
+              -sequence tests/data/testA.fa \
+              -output /tmp/families.fa \
+              -instances /tmp/instances.bed \
+              -stats /tmp/stats.tsv \
+              2>&1 | tee /tmp/valgrind.log | tail -40
