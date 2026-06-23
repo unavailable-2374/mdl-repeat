@@ -145,6 +145,7 @@ void mdl_score_family(CandidateFamily *fam, glen_t genome_len, int num_families)
     (void)genome_len;
 
     fam->model_cost = mdl_model_cost(fam->consensus_length);
+    fam->mdl.model_cost = fam->model_cost;
 
     double total_savings = 0.0;
     for (int i = 0; i < fam->num_instances; i++) {
@@ -173,11 +174,79 @@ void mdl_score_family(CandidateFamily *fam, glen_t genome_len, int num_families)
     }
 
     fam->mdl_score = total_savings - fam->model_cost;
+    fam->mdl.standalone_savings = total_savings;
+    fam->mdl.standalone_score = fam->mdl_score;
+    fam->mdl.exclusive_savings = 0.0;
+    fam->mdl.exclusive_score = 0.0;
+    fam->mdl.report_score = fam->mdl_score;
+    fam->mdl.exclusive_bases = 0;
+    fam->mdl.exclusive_instances = 0;
+    fam->mdl.accept_state = CAND_ACCEPT_UNSCORED;
+    fam->mdl.quality_tier = CAND_TIER_UNSET;
+    fam->mdl.quality_flags = CAND_QF_NONE;
 }
 
 /* ================================================================
  * Greedy MDL library selection
  * ================================================================ */
+
+static void mdl_mark_rejected(CandidateFamily *fam)
+{
+    fam->mdl_score = 0.0;
+    fam->mdl.report_score = 0.0;
+    fam->mdl.accept_state = CAND_ACCEPT_REJECTED;
+    if (fam->mdl.quality_tier == CAND_TIER_UNSET)
+        fam->mdl.quality_tier = CAND_TIER_REJECT;
+}
+
+static void mdl_mark_accepted(CandidateFamily *fam,
+                              CandidateAcceptState state,
+                              CandidateQualityTier tier,
+                              double report_score)
+{
+    fam->mdl_score = report_score;
+    fam->mdl.report_score = report_score;
+    fam->mdl.accept_state = state;
+    fam->mdl.quality_tier = tier;
+}
+
+static uint32_t mdl_quality_base_flags(const CandidateFamily *fam)
+{
+    uint32_t flags = fam->discovery_flags;
+
+    if (fam->consensus_length < 80)
+        flags |= CAND_QF_SHORT_CONSENSUS;
+    if (fam->num_instances < 3)
+        flags |= CAND_QF_LOW_COPY;
+
+    float avg_div = 0.0f;
+    for (int i = 0; i < fam->num_instances; i++)
+        avg_div += fam->instances[i].divergence;
+    if (fam->num_instances > 0)
+        avg_div /= (float)fam->num_instances;
+    if (avg_div >= 0.25f)
+        flags |= CAND_QF_HIGH_DIVERGENCE;
+
+    return flags;
+}
+
+static CandidateQualityTier mdl_quality_tier_for_accept(
+    CandidateAcceptState state, uint32_t flags)
+{
+    uint32_t structural_warn = CAND_QF_SHORT_CONSENSUS |
+                               CAND_QF_LOW_COPY |
+                               CAND_QF_HIGH_DIVERGENCE;
+    uint32_t evidence_warn = CAND_QF_NO_EXCLUSIVE_BASES |
+                             CAND_QF_LOW_EXCLUSIVE_FRAC |
+                             CAND_QF_NONPOSITIVE_EXCL_MDL;
+
+    if (state == CAND_ACCEPT_EXCLUSIVE)
+        return (flags & structural_warn) ? CAND_TIER_WARN : CAND_TIER_CORE;
+    if (state == CAND_ACCEPT_STANDALONE)
+        return (flags & (structural_warn | evidence_warn))
+               ? CAND_TIER_WARN : CAND_TIER_SUPPORTED;
+    return CAND_TIER_REJECT;
+}
 
 /* Comparison for sorting families by MDL score (descending) */
 static int cmp_mdl_desc(const void *a, const void *b)
@@ -251,10 +320,10 @@ MDLResult mdl_select_library(CandidateList *cl, glen_t genome_len)
      * Mark accepted instances' positions as claimed before considering the
      * next family.
      *
-     * On accepted families, fam->mdl_score is rewritten to the exclusive
-     * score (when (a) applies) or kept at the standalone score (when only
-     * (b) applies), so downstream consumers (output_fasta gate, prune)
-     * always see a positive value.  Rejected families have mdl_score zeroed.
+     * On accepted families, the legacy fam->mdl_score is still set to the
+     * report score for backward compatibility, but the full provenance is
+     * retained in fam->mdl: standalone score, exclusive score, acceptance
+     * state, and quality tier.  Rejected families have report score zeroed.
      * Only exclusive_savings are accumulated into result.total_savings to
      * keep the two-part DL valid (no overlap double-counting).
      */
@@ -349,7 +418,8 @@ MDLResult mdl_select_library(CandidateList *cl, glen_t genome_len)
          * (Note: standalone_score is exactly fam->mdl_score at this point,
          * before any rewrite below.) */
         if (fam->mdl_score <= 0 || fam->num_instances < 2) {
-            fam->mdl_score = 0.0;
+            fam->mdl.quality_flags = mdl_quality_base_flags(fam);
+            mdl_mark_rejected(fam);
             continue;
         }
 
@@ -370,7 +440,7 @@ MDLResult mdl_select_library(CandidateList *cl, glen_t genome_len)
             if (!tmp) {
                 fprintf(stderr, "mdl_select: OOM growing fam_iv to %" PRId64
                         " entries\n", new_cap);
-                fam->mdl_score = 0.0;
+                mdl_mark_rejected(fam);
                 continue;
             }
             fam_iv = tmp;
@@ -390,7 +460,7 @@ MDLResult mdl_select_library(CandidateList *cl, glen_t genome_len)
             fam_n++;
         }
         if (fam_n == 0) {
-            fam->mdl_score = 0.0;
+            mdl_mark_rejected(fam);
             continue;
         }
 
@@ -430,12 +500,16 @@ MDLResult mdl_select_library(CandidateList *cl, glen_t genome_len)
          * via binary search on covered_iv. */
         double exclusive_savings = 0.0;
         int    has_any_exclusive = 0;
+        int64_t exclusive_bases_total = 0;
+        int    exclusive_instances = 0;
+        int64_t total_aligned_bases = 0;
 
         for (int j = 0; j < fam->num_instances; j++) {
             Instance *inst = &fam->instances[j];
             gpos_t start = inst->position;
             int    alen  = (int)inst->aligned_length;
             if (alen <= 0) continue;
+            total_aligned_bases += alen;
 
             gpos_t qs = start;
             gpos_t qe = start + (gpos_t)alen;
@@ -461,6 +535,8 @@ MDLResult mdl_select_library(CandidateList *cl, glen_t genome_len)
             if (excl < 0) excl = 0; /* defensive */
             int excl_bases = (int)excl;
             if (excl_bases == 0) continue;
+            exclusive_bases_total += excl_bases;
+            exclusive_instances++;
 
             int excl_edits = (int)(inst->divergence * (double)excl_bases + 0.5);
             if (excl_edits < 0) excl_edits = 0;
@@ -475,6 +551,10 @@ MDLResult mdl_select_library(CandidateList *cl, glen_t genome_len)
         }
 
         double exclusive_score = exclusive_savings - fam->model_cost;
+        fam->mdl.exclusive_savings = exclusive_savings;
+        fam->mdl.exclusive_score = exclusive_score;
+        fam->mdl.exclusive_bases = exclusive_bases_total;
+        fam->mdl.exclusive_instances = exclusive_instances;
         int marginal_pass = (has_any_exclusive && exclusive_score > 0.0);
 
         /* Standalone fallback (Stage B fix 1) — see comment above */
@@ -485,7 +565,16 @@ MDLResult mdl_select_library(CandidateList *cl, glen_t genome_len)
         if (!marginal_pass && !standalone_pass) {
             /* Reject: model cost not justified, even allowing for the
              * standalone fallback. */
-            fam->mdl_score = 0.0;
+            uint32_t qflags = mdl_quality_base_flags(fam);
+            if (!has_any_exclusive)
+                qflags |= CAND_QF_NO_EXCLUSIVE_BASES;
+            if (exclusive_score <= 0.0)
+                qflags |= CAND_QF_NONPOSITIVE_EXCL_MDL;
+            if (total_aligned_bases > 0 &&
+                exclusive_bases_total * 4 < total_aligned_bases)
+                qflags |= CAND_QF_LOW_EXCLUSIVE_FRAC;
+            fam->mdl.quality_flags = qflags;
+            mdl_mark_rejected(fam);
             continue;
         }
 
@@ -493,15 +582,36 @@ MDLResult mdl_select_library(CandidateList *cl, glen_t genome_len)
          *
          * If the family qualifies on its own (exclusive_score > 0), prefer
          * it — that's the rigorous unique-coverage contribution.  Otherwise
-         * report the standalone score so downstream `mdl_score > 0` filters
-         * still see this family as accepted; accumulate only the exclusive
-         * savings (zero if no exclusive bases) so the two-part code total
-         * remains a valid bound (no double counting of overlapped bases). */
+         * report the standalone score and mark the acceptance state as a
+         * standalone fallback.  Accumulate only the exclusive savings (zero
+         * if no exclusive bases) so the two-part code total remains a valid
+         * bound (no overlap double counting). */
         if (marginal_pass) {
-            fam->mdl_score = exclusive_score;
+            uint32_t qflags = mdl_quality_base_flags(fam);
+            if (total_aligned_bases > 0 &&
+                exclusive_bases_total * 4 < total_aligned_bases)
+                qflags |= CAND_QF_LOW_EXCLUSIVE_FRAC;
+            fam->mdl.quality_flags = qflags;
+            CandidateQualityTier tier =
+                mdl_quality_tier_for_accept(CAND_ACCEPT_EXCLUSIVE, qflags);
+            mdl_mark_accepted(fam, CAND_ACCEPT_EXCLUSIVE, tier,
+                              exclusive_score);
             result.total_savings += exclusive_savings;
         } else {
-            fam->mdl_score = standalone_score;
+            uint32_t qflags = mdl_quality_base_flags(fam) |
+                              CAND_QF_STANDALONE_FALLBACK;
+            if (!has_any_exclusive)
+                qflags |= CAND_QF_NO_EXCLUSIVE_BASES;
+            if (exclusive_score <= 0.0)
+                qflags |= CAND_QF_NONPOSITIVE_EXCL_MDL;
+            if (total_aligned_bases > 0 &&
+                exclusive_bases_total * 4 < total_aligned_bases)
+                qflags |= CAND_QF_LOW_EXCLUSIVE_FRAC;
+            fam->mdl.quality_flags = qflags;
+            CandidateQualityTier tier =
+                mdl_quality_tier_for_accept(CAND_ACCEPT_STANDALONE, qflags);
+            mdl_mark_accepted(fam, CAND_ACCEPT_STANDALONE, tier,
+                              standalone_score);
             if (has_any_exclusive)
                 result.total_savings += exclusive_savings;
         }
@@ -529,7 +639,7 @@ MDLResult mdl_select_library(CandidateList *cl, glen_t genome_len)
                 if (marginal_pass) result.total_savings -= exclusive_savings;
                 else if (has_any_exclusive)
                                    result.total_savings -= exclusive_savings;
-                fam->mdl_score = 0.0;
+                mdl_mark_rejected(fam);
                 continue;
             }
             merge_buf = tmp;

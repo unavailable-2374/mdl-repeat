@@ -46,9 +46,9 @@ typedef struct {
 
 /*
  * Multi-k-mer seeded instance collection + banded alignment.
- * For families with consensus_length < 500 bp, tries dc-megablast first
+ * For families with consensus_length < 500 bp, tries RMBlast first
  * (more sensitive for short divergent elements); falls back to banded DP
- * if blastn is not in PATH.
+ * if rmblastn is not in PATH.
  * Modifies fam->instances in place.
  */
 int align_collect_instances(CandidateFamily *fam, const Genome *genome,
@@ -85,10 +85,10 @@ void align_refine_all(CandidateList *cl, const Genome *genome,
                       int verbose);
 
 /*
- * BLAST-based batch instance recruitment for short families
- * (consensus_length < BLAST_SHORT_THRESHOLD = 500 bp).
+ * RMBlast-based batch instance recruitment for short families
+ * (consensus_length < RMBLAST_SHORT_THRESHOLD = 500 bp).
  *
- * Runs ONE dc-megablast job with all short-family consensuses as a single
+ * Runs ONE rmblastn job with all short-family consensuses as a single
  * multi-FASTA query file (query ID = family index).  Parses BLAST output
  * and distributes hits to the appropriate CandidateFamily.  Much faster
  * than per-family BLAST calls.
@@ -97,7 +97,7 @@ void align_refine_all(CandidateList *cl, const Genome *genome,
  * recruitment step.  Families that already have enough instances are
  * skipped (their instances are merged with BLAST hits).
  *
- * Returns total instances added across all families, or -1 if blastn
+ * Returns total instances added across all families, or -1 if rmblastn
  * is unavailable (caller should log and skip).
  */
 int align_blast_recruit_short_families(CandidateList *cl,

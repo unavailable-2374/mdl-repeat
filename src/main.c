@@ -34,6 +34,8 @@
 #include "refine.h"
 #include "output.h"
 #include "cmd_line_opts.h"
+#include "rescue.h"
+#include "external_qc.h"
 
 /* ================================================================
  * Trace-dump helpers (enabled by -trace-dir <dir>)
@@ -45,7 +47,7 @@
  * Dump one pipeline stage: writes .fa, .bed, .tsv under trace_dir.
  * stage_num is 1-based (01..08), stage_name is a short label.
  * genome may be NULL at stages where instance coords are not meaningful.
- * mdl_filter: if non-zero, only dump families with mdl_score > 0
+ * mdl_filter: if non-zero, only dump accepted families
  *             (use after mdl_select_library to show only accepted families).
  */
 static void trace_dump_filtered(const char *trace_dir, int stage_num,
@@ -65,7 +67,7 @@ static void trace_dump_filtered(const char *trace_dir, int stage_num,
     if (mdl_filter) {
         /* Count only accepted families for the header */
         for (int i = 0; i < cl->num_families; i++)
-            if (cl->families[i].mdl_score > 0) n_fam++;
+            if (candidate_is_accepted(&cl->families[i])) n_fam++;
     }
 
     snprintf(path, sizeof(path), "%s/%02d_%s.fa", trace_dir, stage_num, stage_name);
@@ -76,9 +78,10 @@ static void trace_dump_filtered(const char *trace_dir, int stage_num,
             for (int i = 0; i < cl->num_families; i++) {
                 const CandidateFamily *f = &cl->families[i];
                 if (!f->consensus || f->consensus_length <= 0) continue;
-                if (mdl_filter && f->mdl_score <= 0) continue;
+                if (mdl_filter && !candidate_is_accepted(f)) continue;
                 fprintf(fp, ">R=%d length=%d copies=%d mdl=%.1f\n",
-                        f->id, f->consensus_length, f->num_instances, f->mdl_score);
+                        f->id, f->consensus_length, f->num_instances,
+                        candidate_report_score(f));
                 for (int j = 0; j < f->consensus_length; j++) {
                     fputc(num_to_char(f->consensus[j]), fp);
                     if ((j + 1) % 80 == 0) fputc('\n', fp);
@@ -98,7 +101,7 @@ static void trace_dump_filtered(const char *trace_dir, int stage_num,
             for (int i = 0; i < cl->num_families; i++) {
                 const CandidateFamily *f = &cl->families[i];
                 if (!f->instances || f->num_instances <= 0) continue;
-                if (mdl_filter && f->mdl_score <= 0) continue;
+                if (mdl_filter && !candidate_is_accepted(f)) continue;
                 for (int j = 0; j < f->num_instances; j++) {
                     const Instance *inst = &f->instances[j];
                     gpos_t raw_start = inst->position - PADLENGTH;
@@ -133,19 +136,32 @@ static void trace_dump_filtered(const char *trace_dir, int stage_num,
         FILE *fp = fopen(path, "w");
         if (fp) {
             fprintf(fp, "family_id\tconsensus_length\tnum_instances\t"
-                        "divergence_mean\tmdl_score\tmodel_cost\ttopology\n");
+                        "divergence_mean\tmdl_score\tmodel_cost\ttopology\t"
+                        "standalone_score\texclusive_score\texclusive_bases\t"
+                        "exclusive_instances\tacceptance\tquality_tier\tquality_flags\t"
+                        "quality_notes\n");
             for (int i = 0; i < cl->num_families; i++) {
                 const CandidateFamily *f = &cl->families[i];
-                if (mdl_filter && f->mdl_score <= 0) continue;
+                if (mdl_filter && !candidate_is_accepted(f)) continue;
                 float avg_div = 0;
                 for (int j = 0; j < f->num_instances; j++)
                     avg_div += f->instances[j].divergence;
                 if (f->num_instances > 0) avg_div /= f->num_instances;
                 const char *topo = (f->topology == TOPO_LINEAR) ? "linear" :
                                    (f->topology == TOPO_CYCLIC) ? "cyclic" : "complex";
-                fprintf(fp, "%d\t%d\t%d\t%.4f\t%.1f\t%.1f\t%s\n",
+                char qflags[256];
+                candidate_quality_flags_string(f->mdl.quality_flags, qflags,
+                                               sizeof(qflags));
+                fprintf(fp, "%d\t%d\t%d\t%.4f\t%.1f\t%.1f\t%s\t"
+                            "%.1f\t%.1f\t%" PRId64 "\t%d\t%s\t%s\t0x%08x\t%s\n",
                         f->id, f->consensus_length, f->num_instances,
-                        avg_div, f->mdl_score, f->model_cost, topo);
+                        avg_div, candidate_report_score(f),
+                        candidate_model_cost(f), topo,
+                        f->mdl.standalone_score, f->mdl.exclusive_score,
+                        f->mdl.exclusive_bases, f->mdl.exclusive_instances,
+                        candidate_accept_state_name(f->mdl.accept_state),
+                        candidate_quality_tier_name(f->mdl.quality_tier),
+                        (unsigned)f->mdl.quality_flags, qflags);
             }
             fclose(fp);
         }
@@ -153,7 +169,7 @@ static void trace_dump_filtered(const char *trace_dir, int stage_num,
 
     fprintf(stderr, "[trace] stage %02d %-12s: %d families, %d instances%s\n",
             stage_num, stage_name, n_fam, n_inst,
-            mdl_filter ? " (mdl_score>0 only)" : "");
+            mdl_filter ? " (accepted only)" : "");
     (void)view; /* suppress unused warning */
 }
 
@@ -183,13 +199,6 @@ static int default_k(glen_t len)
  * Long sequences (> 1.8 * chunk_size) are recursively halved with overlap
  * at split points to avoid missing repeats at boundaries.
  */
-typedef struct {
-    int    seq_index;     /* index into original genome's sequences */
-    gpos_t raw_start;     /* start in genome raw coords (pre-padding) */
-    gpos_t raw_end;       /* end in genome raw coords (pre-padding) */
-    glen_t seg_length;    /* = raw_end - raw_start */
-} SeqSegment;
-
 static int cmp_seg_length_desc(const void *a, const void *b)
 {
     glen_t la = ((const SeqSegment *)a)->seg_length;
@@ -782,6 +791,11 @@ static void usage(void)
         "  -tandemdist #      Min distance between same-strand l-mers (default: 500)\n"
         "  -maxoccurrences #  Max occurrences per seed (default: 10000)\n"
         "  -maxrepeats #      Max families to discover (default: 100000)\n"
+        "  -recall-rescue    Run bounded secondary discovery with shorter l-mer seeds\n"
+        "  -rescue-full-genome Run rescue discovery on the full genome instead of gaps\n"
+        "  -rescue-l-delta # Shorten rescue l-mer length by N (default: 1, min l=8)\n"
+        "  -rescue-maxrepeats # Max rescue families to append (default: 2000)\n"
+        "  -rescue-min-gap # Min uncovered gap length for targeted rescue (default: 200)\n"
         "  -chunk-size #      Chunk size in Mb for large genome discovery (default: 200)\n"
         "  -sample-size #     Sample size in Mb for large genomes (default: 1000)\n"
         "  -sample-output <file> Write sampled genome FASTA for reproducibility\n"
@@ -800,6 +814,11 @@ static void usage(void)
         "  -instances <file>  Output instance BED\n"
         "  -stats <file>      Output family statistics TSV\n"
         "  -trace-dir <dir>   Dump FASTA+BED+TSV after each refine stage (diagnostics)\n"
+        "  -split-audit <file> Write split-stage decision audit TSV\n"
+        "  -rescue-audit <file> Write recall-rescue target/candidate audit TSV\n"
+        "  -external-tools <mode> External tool policy: off|auto|require (default: off)\n"
+        "  -external-qc <file> Write optional seqkit stats TSV for final FASTA\n"
+        "  -seqkit <path>      Path to seqkit executable for -external-qc\n"
         "  -v / -vv           Verbosity level\n"
     );
     exit(1);
@@ -814,9 +833,20 @@ int main(int argc, char *argv[])
     char *freq_file = NULL;
     char *freq_output = NULL;
     char *trace_dir = NULL;
+    char *split_audit_file = NULL;
+    char *rescue_audit_file = NULL;
+    char *external_tools_mode_str = NULL;
+    char *external_qc_file = NULL;
+    char *seqkit_path = NULL;
     int num_threads = 1;
     int verbose = 0;
     float coalesce_factor = 20.0f;
+    ExternalToolsMode external_tools_mode = EXTERNAL_TOOLS_OFF;
+    int recall_rescue = 0;
+    int rescue_full_genome = 0;
+    int rescue_l_delta = 1;
+    int rescue_maxrepeats = 2000;
+    int rescue_min_gap = 200;
     int x;
 
     /* Parse required arguments */
@@ -831,6 +861,77 @@ int main(int argc, char *argv[])
     co_get_string(argc, argv, "-freq-output", &freq_output);
     co_get_string(argc, argv, "-freq", &freq_file);
     co_get_string(argc, argv, "-trace-dir", &trace_dir);
+    co_get_string(argc, argv, "-split-audit", &split_audit_file);
+    co_get_string(argc, argv, "-rescue-audit", &rescue_audit_file);
+    co_get_string(argc, argv, "-external-tools", &external_tools_mode_str);
+    co_get_string(argc, argv, "-external-qc", &external_qc_file);
+    co_get_string(argc, argv, "-seqkit", &seqkit_path);
+    if (co_has_option(argc, argv, "-split-audit") && !split_audit_file) {
+        fprintf(stderr, "ERROR: -split-audit requires a file path\n");
+        return 1;
+    }
+    if (co_has_option(argc, argv, "-rescue-audit") && !rescue_audit_file) {
+        fprintf(stderr, "ERROR: -rescue-audit requires a file path\n");
+        return 1;
+    }
+    if (co_has_option(argc, argv, "-external-tools") &&
+        !external_tools_mode_str) {
+        fprintf(stderr, "ERROR: -external-tools requires off|auto|require\n");
+        return 1;
+    }
+    if (external_tools_mode_str &&
+        !external_tools_mode_parse(external_tools_mode_str,
+                                   &external_tools_mode)) {
+        fprintf(stderr, "ERROR: -external-tools must be off, auto, or require\n");
+        return 1;
+    }
+    if (co_has_option(argc, argv, "-external-qc") && !external_qc_file) {
+        fprintf(stderr, "ERROR: -external-qc requires a file path\n");
+        return 1;
+    }
+    if (co_has_option(argc, argv, "-seqkit") && !seqkit_path) {
+        fprintf(stderr, "ERROR: -seqkit requires a file path\n");
+        return 1;
+    }
+    if (external_qc_file && external_tools_mode == EXTERNAL_TOOLS_OFF) {
+        external_tools_mode = EXTERNAL_TOOLS_AUTO;
+    }
+    g_refine_split_audit_path = split_audit_file;
+    co_get_bool(argc, argv, "-recall-rescue", &recall_rescue);
+    co_get_bool(argc, argv, "-rescue-full-genome", &rescue_full_genome);
+    if (co_has_option(argc, argv, "-rescue-l-delta") &&
+        !co_get_int(argc, argv, "-rescue-l-delta", &rescue_l_delta)) {
+        fprintf(stderr, "ERROR: -rescue-l-delta requires an integer\n");
+        return 1;
+    }
+    if (co_get_int(argc, argv, "-rescue-l-delta", &rescue_l_delta)) {
+        if (rescue_l_delta < 0 || rescue_l_delta > 8) {
+            fprintf(stderr, "ERROR: -rescue-l-delta must be in [0, 8]\n");
+            return 1;
+        }
+    }
+    if (co_has_option(argc, argv, "-rescue-maxrepeats") &&
+        !co_get_int(argc, argv, "-rescue-maxrepeats", &rescue_maxrepeats)) {
+        fprintf(stderr, "ERROR: -rescue-maxrepeats requires an integer\n");
+        return 1;
+    }
+    if (co_get_int(argc, argv, "-rescue-maxrepeats", &rescue_maxrepeats)) {
+        if (rescue_maxrepeats < 1) {
+            fprintf(stderr, "ERROR: -rescue-maxrepeats must be positive\n");
+            return 1;
+        }
+    }
+    if (co_has_option(argc, argv, "-rescue-min-gap") &&
+        !co_get_int(argc, argv, "-rescue-min-gap", &rescue_min_gap)) {
+        fprintf(stderr, "ERROR: -rescue-min-gap requires an integer\n");
+        return 1;
+    }
+    if (co_get_int(argc, argv, "-rescue-min-gap", &rescue_min_gap)) {
+        if (rescue_min_gap < 1) {
+            fprintf(stderr, "ERROR: -rescue-min-gap must be positive\n");
+            return 1;
+        }
+    }
     if (trace_dir) {
         /* Create trace directory if it doesn't exist */
         if (mkdir(trace_dir, 0755) != 0 && errno != EEXIST) {
@@ -840,9 +941,6 @@ int main(int argc, char *argv[])
             fprintf(stderr, "Trace dumps enabled → %s\n", trace_dir);
         }
     }
-    /* If -freq matched -freq-output, clear it */
-    if (freq_file && freq_output && freq_file == freq_output)
-        freq_file = NULL;
     co_get_int(argc, argv, "-threads", &num_threads);
     if (num_threads < 1) num_threads = 1;
 
@@ -1037,6 +1135,38 @@ int main(int argc, char *argv[])
         }
         return 1;
     }
+
+    if (recall_rescue) {
+        RecallRescueOptions rescue_options;
+        rescue_options.full_genome = rescue_full_genome;
+        rescue_options.l_delta = rescue_l_delta;
+        rescue_options.max_repeats = rescue_maxrepeats;
+        rescue_options.min_gap = rescue_min_gap;
+        rescue_options.verbose = verbose;
+        rescue_options.num_threads = num_threads;
+        rescue_options.chunk_size = chunk_size;
+        rescue_options.audit_file = rescue_audit_file;
+
+        RecallRescueCallbacks rescue_callbacks;
+        rescue_callbacks.create_chunk = genome_create_chunk;
+        rescue_callbacks.free_chunk = genome_free_chunk;
+        rescue_callbacks.discover_chunked = discover_chunked;
+        rescue_callbacks.remap_instance_coordinates = remap_instance_coordinates;
+
+        if (recall_rescue_run(genome, candidates, &dparams,
+                              &rescue_options, &rescue_callbacks) < 0) {
+            candidates_free(candidates);
+            if (sample_segments) {
+                free(sample_segments);
+                genome_free_chunk(genome);
+                genome_free(full_genome);
+            } else {
+                genome_free(genome);
+            }
+            return 1;
+        }
+    }
+
     if (verbose) candidates_print_stats(candidates);
     /* Trace stage 01: discover */
     if (trace_dir) trace_dump(trace_dir, 1, "discover", candidates, genome);
@@ -1116,7 +1246,7 @@ int main(int argc, char *argv[])
     /* Phase 5 (F') REVERTED 2026-05-01: Step 4b (align_refine_all pre-pass)
      * caused 12x instance explosion that made refine_assemble_fragments
      * O(n²) hang for 27+ hours on TAIR10 nuclear (single-thread, 11 GB RSS,
-     * no completion). Step 4c (BLAST short-family recruit) was bundled with
+     * no completion). Step 4c (RMBlast short-family recruit) was bundled with
      * 4b and is reverted together. chr4 family-level recall also regressed
      * (-7.5pp 80×80, -60pp on 10-99 copy bin).
      * Functions align_blast_recruit_short_families and the early
@@ -1175,7 +1305,7 @@ int main(int argc, char *argv[])
     fprintf(stderr, "  Library cost:         %.0f bits\n", mdl_result.dl_library);
     fprintf(stderr, "  Total savings:        %.0f bits\n", mdl_result.total_savings);
     fprintf(stderr, "  Compression ratio:    %.4f\n", mdl_result.compression_ratio);
-    /* Trace stage 06: mdl_select — only accepted families (mdl_score > 0) */
+    /* Trace stage 06: mdl_select — only accepted families */
     if (trace_dir) trace_dump_filtered(trace_dir, 6, "mdl_select", candidates, genome, 1);
 
     /* ================================================================
@@ -1185,7 +1315,7 @@ int main(int argc, char *argv[])
                                           mdl_result.num_accepted);
     if (n_pruned > 0)
         fprintf(stderr, "Pruned %d marginal families\n", n_pruned);
-    /* Trace stage 07: prune — only accepted families (mdl_score > 0) */
+    /* Trace stage 07: prune — only accepted families */
     if (trace_dir) trace_dump_filtered(trace_dir, 7, "prune", candidates, genome, 1);
 
     /* ================================================================
@@ -1201,7 +1331,7 @@ int main(int argc, char *argv[])
         if (n_coalesced > 0)
             fprintf(stderr, "Coalesced %d tandem instance pairs\n", n_coalesced);
     }
-    /* Trace stage 08: coalesce — only accepted families (mdl_score > 0) */
+    /* Trace stage 08: coalesce — only accepted families */
     if (trace_dir) trace_dump_filtered(trace_dir, 8, "coalesce", candidates, genome, 1);
 
     /* ================================================================
@@ -1221,6 +1351,27 @@ int main(int argc, char *argv[])
 
     if (stats_file)
         output_stats(stats_file, candidates);
+
+    if (external_qc_file) {
+        ExternalQcConfig external_qc;
+        memset(&external_qc, 0, sizeof(external_qc));
+        external_qc.mode = external_tools_mode;
+        external_qc.seqkit_path = seqkit_path;
+        external_qc.qc_output_path = external_qc_file;
+        external_qc.timeout_sec = 300;
+        if (external_qc_run_seqkit_stats(&external_qc, output_file) != 0) {
+            candidates_free(candidates);
+            kmer_free(kt);
+            if (sample_segments) {
+                free(sample_segments);
+                genome_free_chunk(genome);
+                genome_free(full_genome);
+            } else {
+                genome_free(genome);
+            }
+            return 1;
+        }
+    }
 
     /* Cleanup */
     candidates_free(candidates);

@@ -11,7 +11,9 @@
  * Uses Rissanen's universal integer code and two-part coding scheme:
  *   DL(total) = DL(Library) + DL(Genome | Library)
  *
- * A family is accepted if its MDL score (savings - model_cost) > 0.
+ * Per-family scoring records standalone compression evidence.  Final
+ * library selection separately records exclusive contribution and acceptance
+ * state in CandidateFamily.mdl.
  */
 
 /* --- MDL mode for position encoding --- */
@@ -65,7 +67,8 @@ double mdl_model_cost(int consensus_length);
 
 /*
  * Compute MDL score for a single candidate family.
- * Fills fam->mdl_score and fam->model_cost.
+ * Fills legacy fam->mdl_score/model_cost plus CandidateFamily.mdl
+ * standalone fields.  Does not mark final acceptance.
  *
  * Parameters:
  *   fam          - candidate family with consensus and instances
@@ -95,16 +98,16 @@ typedef struct {
  * 1. Score every candidate family (single pass — see mdl_select_library
  *    implementation for why the historical iterative R-convergence loop
  *    was removed).
- * 2. Sort by raw mdl_score descending.
+ * 2. Sort by standalone score descending.
  * 3. Walk in order; for each family compute its EXCLUSIVE savings using
  *    only positions not yet claimed by a higher-scoring family.  Accept
  *    iff EITHER (a) exclusive_savings > model_cost  OR
  *    (b) standalone score > 0 AND consensus_length >= 50 AND
  *        num_instances >= 3.
  *    Mark accepted instances' positions as claimed before moving on.
- * 4. The accepted family's mdl_score is rewritten to the exclusive
- *    score (when (a) applies) or left at the standalone score (when
- *    only (b) applies); rejected families have mdl_score zeroed.
+ * 4. CandidateFamily.mdl records standalone score, exclusive score,
+ *    acceptance state, and quality tier.  Legacy mdl_score is still
+ *    synchronized to the report score for backward compatibility.
  * 5. Library cost includes L_int(R) for encoding the number of families.
  *
  * The unique-coverage step is required for correctness of the two-part
@@ -115,7 +118,8 @@ typedef struct {
  * (b) contribute zero savings to the running total when they have no
  * exclusive bases, preserving the two-part bound.
  *
- * Modifies candidates in place (reorders, rewrites mdl_score).
+ * Modifies candidates in place (reorders, fills CandidateFamily.mdl, and
+ * synchronizes legacy mdl_score/model_cost aliases).
  * Returns the MDL result summary.
  */
 MDLResult mdl_select_library(CandidateList *cl, glen_t genome_len);

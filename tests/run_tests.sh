@@ -147,6 +147,50 @@ $BIN -sequence "$DATA_DIR/testC.fa" -output "$RESULTS_DIR/testC_families.fa" \
 n_fam_c=$(grep -c "^>" "$RESULTS_DIR/testC_families.fa" 2>/dev/null || echo 0)
 check "Test C: found at least 1 family" "[ $n_fam_c -ge 1 ]"
 
+# Test C2 — bounded recall rescue pass
+echo ""
+echo "--- Test C2: Bounded recall rescue discovery ---"
+TESTC_RESCUE_FA="$RESULTS_DIR/testC_rescue_families.fa"
+TESTC_RESCUE_TSV="$RESULTS_DIR/testC_rescue_stats.tsv"
+TESTC_RESCUE_LOG="$RESULTS_DIR/testC_rescue.log"
+TESTC_RESCUE_AUDIT="$RESULTS_DIR/testC_rescue_audit.tsv"
+$BIN -sequence "$DATA_DIR/testC.fa" -output "$TESTC_RESCUE_FA" \
+     -stats "$TESTC_RESCUE_TSV" \
+     -recall-rescue -rescue-maxrepeats 5 \
+     -rescue-audit "$TESTC_RESCUE_AUDIT" -v \
+     2>"$TESTC_RESCUE_LOG" || true
+
+check "Test C2: rescue pass honors maxrepeats parameter" \
+      "grep -q 'Recall rescue discovery: .*MAXR=5' '$TESTC_RESCUE_LOG'"
+check "Test C2: rescue pass defaults to targeted mode" \
+      "grep -q 'mode=targeted' '$TESTC_RESCUE_LOG' && grep -q 'Recall rescue targeted' '$TESTC_RESCUE_LOG'"
+check "Test C2: rescue append reports duplicate filtering" \
+      "grep -Eq 'Recall rescue appended [0-9]+ candidate families \\(filtered [0-9]+ duplicates\\)' '$TESTC_RESCUE_LOG'"
+check "Test C2: rescue log summarizes duplicate evidence metrics" \
+      "grep -Eq 'Recall rescue evidence: candidates=[0-9]+, max_identity=[0-9.]+, max_containment=[0-9.]+, max_length_ratio=[0-9.]+, near_duplicates=[0-9]+' '$TESTC_RESCUE_LOG'"
+check "Test C2: rescue audit records target and candidate decisions" \
+      "grep -q '^record_type' '$TESTC_RESCUE_AUDIT' && grep -q '^target_segment' '$TESTC_RESCUE_AUDIT' && grep -q '^candidate' '$TESTC_RESCUE_AUDIT'"
+check "Test C2: rescue audit records duplicate evidence metrics" \
+      "head -1 '$TESTC_RESCUE_AUDIT' | grep -q 'consensus_identity.*contained_instance_fraction.*length_ratio'"
+check "Test C2: rescue candidates carry quality provenance" \
+      "grep -q 'rescue_discovery' '$TESTC_RESCUE_TSV'"
+check "Test C2: missing rescue audit path is rejected" \
+      "$BIN -sequence '$DATA_DIR/testC.fa' -output '$RESULTS_DIR/testC_missing_audit.fa' -recall-rescue -rescue-audit -v 2>'$RESULTS_DIR/testC_missing_audit.log'; [ \$? -ne 0 ] && grep -q 'ERROR: -rescue-audit requires a file path' '$RESULTS_DIR/testC_missing_audit.log'"
+
+# Test C3 — external tool QC policy is optional and non-mutating by default
+echo ""
+echo "--- Test C3: External tool QC policy ---"
+TESTC_EXT_FA="$RESULTS_DIR/testC_external_families.fa"
+TESTC_EXT_QC="$RESULTS_DIR/testC_external_qc.tsv"
+TESTC_EXT_LOG="$RESULTS_DIR/testC_external.log"
+$BIN -sequence "$DATA_DIR/testC.fa" -output "$TESTC_EXT_FA" \
+     -external-qc "$TESTC_EXT_QC" \
+     2>"$TESTC_EXT_LOG" || true
+check "Test C3: optional external QC absence does not fail core run" \
+      "[ -s '$TESTC_EXT_FA' ] && grep -Eq 'External QC: seqkit stats wrote|WARNING: optional external QC seqkit' '$TESTC_EXT_LOG'"
+check "Test C3: required missing external QC fails clearly" \
+      "$BIN -sequence '$DATA_DIR/testC.fa' -output '$RESULTS_DIR/testC_external_required.fa' -external-tools require -external-qc '$RESULTS_DIR/testC_external_required_qc.tsv' -seqkit '$RESULTS_DIR/no_such_seqkit' 2>'$RESULTS_DIR/testC_external_required.log'; [ \$? -ne 0 ] && grep -q 'ERROR: required external QC seqkit failed' '$RESULTS_DIR/testC_external_required.log'"
+
 # Test D — Nested TE
 echo ""
 echo "--- Test D: Nested TE (SINE inside LINE) ---"
@@ -157,7 +201,7 @@ $BIN -sequence "$DATA_DIR/testD.fa" -output "$RESULTS_DIR/testD_families.fa" \
 n_fam_d=$(grep -c "^>" "$RESULTS_DIR/testD_families.fa" 2>/dev/null || echo 0)
 check "Test D: found families (>= 1)" "[ $n_fam_d -ge 1 ]"
 
-# Test G — REMOVED 2026-05-01: tested Phase 5 F' BLAST recruit which was
+# Test G — REMOVED 2026-05-01: tested Phase 5 F' RMBlast recruit which was
 # reverted (Step 4b pre-pass caused 27+ hour TAIR10 hang via O(n²) assemble;
 # chr4 family-level recall regressed -7.5pp 80×80). Test G fixtures retained
 # in tests/data/testG.fa for future restoration if F' is re-implemented with
@@ -179,13 +223,15 @@ if [ -f "$TESTF_FA" ]; then
     TESTF_T4_FA="$RESULTS_DIR/testF_t4_families.fa"
     TESTF_T1_LOG="$RESULTS_DIR/testF_t1.log"
     TESTF_T4_LOG="$RESULTS_DIR/testF_t4.log"
+    TESTF_T1_AUDIT="$RESULTS_DIR/testF_t1_split_audit.tsv"
+    TESTF_T4_AUDIT="$RESULTS_DIR/testF_t4_split_audit.tsv"
 
     $BIN -sequence "$TESTF_FA" -output "$TESTF_T1_FA" \
-         -threads 1 -vv \
+         -threads 1 -vv -split-audit "$TESTF_T1_AUDIT" \
          2>"$TESTF_T1_LOG" || true
 
     $BIN -sequence "$TESTF_FA" -output "$TESTF_T4_FA" \
-         -threads 4 -vv \
+         -threads 4 -vv -split-audit "$TESTF_T4_AUDIT" \
          2>"$TESTF_T4_LOG" || true
 
     # 1. Instrumentation: [split] lines are emitted
@@ -194,6 +240,14 @@ if [ -f "$TESTF_FA" ]; then
 
     n_split_lines_t4=$(grep -c "\[split\]" "$TESTF_T4_LOG" 2>/dev/null || echo 0)
     check "Test F (-threads 4): [split] instrumentation lines present" "[ $n_split_lines_t4 -ge 1 ]"
+
+    # 1b. Split audit: every thread mode emits a decision TSV.
+    n_audit_t1=$(wc -l < "$TESTF_T1_AUDIT" 2>/dev/null || echo 0)
+    n_audit_t4=$(wc -l < "$TESTF_T4_AUDIT" 2>/dev/null || echo 0)
+    check "Test F (-threads 1): split audit TSV has decision rows" \
+          "[ -f '$TESTF_T1_AUDIT' ] && grep -q 'decision' '$TESTF_T1_AUDIT' && [ $n_audit_t1 -ge 2 ]"
+    check "Test F (-threads 4): split audit TSV has decision rows" \
+          "[ -f '$TESTF_T4_AUDIT' ] && grep -q 'decision' '$TESTF_T4_AUDIT' && [ $n_audit_t4 -ge 2 ]"
 
     # 2. Family count sanity: should find at least 1, at most 6
     n_fam_f1=$(grep -c "^>" "$TESTF_T1_FA" 2>/dev/null || echo 0)

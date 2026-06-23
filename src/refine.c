@@ -10,6 +10,7 @@
 
 /* Runtime-configurable max DP cells (default 10M ~40MB) */
 int64_t g_refine_max_dp_cells = 10 * 1000 * 1000;
+const char *g_refine_split_audit_path = NULL;
 
 /* ================================================================
  * K-mer profile for fast screening
@@ -1172,6 +1173,16 @@ static int build_subset_consensus(const CandidateFamily *fam,
 typedef struct {
     int       family_idx;    /* which family was split */
     int       valid;         /* 1 if split accepted */
+    int       audited;
+    int       family_id;
+    int       consensus_length;
+    int       num_instances;
+    const char *decision;
+    float     threshold;
+    float     bimodality;
+    int       valley_pass;
+    float     div_gap;
+    double    min_acceptable;
     Instance *lo_insts;
     int       n_lo;
     char     *lo_cons;
@@ -1189,6 +1200,58 @@ typedef struct {
     double    orig_score;
     double    split_score;
 } SplitResult;
+
+static FILE *split_audit_open(void)
+{
+    if (!g_refine_split_audit_path) return NULL;
+
+    FILE *fp = fopen(g_refine_split_audit_path, "w");
+    if (!fp) {
+        fprintf(stderr, "WARNING: could not open split audit '%s'\n",
+                g_refine_split_audit_path);
+        return NULL;
+    }
+
+    fprintf(fp, "family_id\tconsensus_length\tnum_instances\tdecision\t"
+                "threshold\tbimodality\tvalley_pass\tn_lo\tn_hi\t"
+                "mean_lo\tmean_hi\tdiv_gap\torig_score\tsplit_score\t"
+                "min_acceptable\tlo_score\thi_score\tlo_len\thi_len\n");
+    return fp;
+}
+
+static void split_audit_write(FILE *fp, int family_id, int consensus_length,
+                              int num_instances, const char *decision,
+                              float threshold, float bimodality,
+                              int valley_pass, int n_lo, int n_hi,
+                              float mean_lo, float mean_hi,
+                              double orig_score, double split_score,
+                              double min_acceptable,
+                              double lo_score, double hi_score,
+                              int lo_len, int hi_len)
+{
+    if (!fp) return;
+    float div_gap = (n_lo > 0 && n_hi > 0) ? (mean_hi - mean_lo) : 0.0f;
+    fprintf(fp, "%d\t%d\t%d\t%s\t%.6f\t%.6f\t%d\t%d\t%d\t"
+                "%.6f\t%.6f\t%.6f\t%.3f\t%.3f\t%.3f\t"
+                "%.3f\t%.3f\t%d\t%d\n",
+            family_id, consensus_length, num_instances,
+            decision ? decision : "unknown",
+            threshold, bimodality, valley_pass, n_lo, n_hi,
+            mean_lo, mean_hi, div_gap, orig_score, split_score,
+            min_acceptable, lo_score, hi_score, lo_len, hi_len);
+}
+
+static void split_audit_write_result(FILE *fp, const SplitResult *res)
+{
+    if (!fp || !res || !res->audited) return;
+    split_audit_write(fp, res->family_id, res->consensus_length,
+                      res->num_instances, res->decision,
+                      res->threshold, res->bimodality, res->valley_pass,
+                      res->n_lo, res->n_hi, res->mean_lo, res->mean_hi,
+                      res->orig_score, res->split_score,
+                      res->min_acceptable, res->lo_mdl_score,
+                      res->hi_mdl_score, res->lo_clen, res->hi_clen);
+}
 
 /* ----------------------------------------------------------------
  * Phase 1 worker: parallel split analysis (read-only on cl)
@@ -1218,8 +1281,15 @@ static void *split_analysis_worker(void *arg)
         res->valid = 0;
 
         const CandidateFamily *fam = &w->families[fi];
+        res->audited = 1;
+        res->family_id = fam->id;
+        res->consensus_length = fam->consensus_length;
+        res->num_instances = fam->num_instances;
+        res->decision = "not_evaluated";
+        res->valley_pass = 1;
 
         if (fam->num_instances < REFINE_MIN_SPLIT_INSTANCES) {
+            res->decision = "skip_too_few_instances";
             if (w->verbose >= 2)
                 fprintf(stderr, "  [split] F%d: skipped: n_instances=%d < "
                         "REFINE_MIN_SPLIT_INSTANCES=%d\n",
@@ -1229,7 +1299,10 @@ static void *split_analysis_worker(void *arg)
 
         /* Collect divergence values */
         float *divs = malloc((size_t)fam->num_instances * sizeof(float));
-        if (!divs) continue;
+        if (!divs) {
+            res->decision = "error_alloc_divs";
+            continue;
+        }
         for (int j = 0; j < fam->num_instances; j++)
             divs[j] = fam->instances[j].divergence;
 
@@ -1238,8 +1311,12 @@ static void *split_analysis_worker(void *arg)
         int valley_pass;
         float threshold = otsu_threshold(divs, fam->num_instances, &bimodality,
                                          &valley_pass);
+        res->threshold = threshold;
+        res->bimodality = bimodality;
+        res->valley_pass = valley_pass;
 
         if (bimodality < REFINE_BIMODALITY_THRESH) {
+            res->decision = "reject_bimodality";
             if (w->verbose >= 2)
                 fprintf(stderr, "  [split] F%d: rejected: bimodality=%.3f < "
                         "threshold=%.3f (n=%d)\n",
@@ -1251,6 +1328,7 @@ static void *split_analysis_worker(void *arg)
 
         /* Valley depth check */
         if (!valley_pass) {
+            res->decision = "reject_valley";
             if (w->verbose >= 2)
                 fprintf(stderr, "  [split] F%d: rejected: valley not deep enough "
                         "(bimodality=%.3f, n=%d)\n",
@@ -1265,9 +1343,12 @@ static void *split_analysis_worker(void *arg)
             if (divs[j] <= threshold) n_lo++;
             else n_hi++;
         }
+        res->n_lo = n_lo;
+        res->n_hi = n_hi;
 
         if (n_lo < REFINE_MIN_CLUSTER_SIZE ||
             n_hi < REFINE_MIN_CLUSTER_SIZE) {
+            res->decision = "reject_cluster_size";
             if (w->verbose >= 2)
                 fprintf(stderr, "  [split] F%d: rejected: n_lo=%d or n_hi=%d < "
                         "REFINE_MIN_CLUSTER_SIZE=%d (threshold=%.3f, n=%d)\n",
@@ -1285,8 +1366,12 @@ static void *split_analysis_worker(void *arg)
         }
         mean_lo /= n_lo;
         mean_hi /= n_hi;
+        res->mean_lo = mean_lo;
+        res->mean_hi = mean_hi;
+        res->div_gap = mean_hi - mean_lo;
 
         if (mean_hi - mean_lo < REFINE_MIN_DIV_GAP) {
+            res->decision = "reject_div_gap";
             if (w->verbose >= 2)
                 fprintf(stderr, "  [split] F%d: rejected: div_gap=%.3f < "
                         "REFINE_MIN_DIV_GAP=%.3f (mean_lo=%.3f mean_hi=%.3f, n=%d)\n",
@@ -1300,6 +1385,7 @@ static void *split_analysis_worker(void *arg)
         Instance *lo_insts = malloc((size_t)n_lo * sizeof(Instance));
         Instance *hi_insts = malloc((size_t)n_hi * sizeof(Instance));
         if (!lo_insts || !hi_insts) {
+            res->decision = "error_alloc_split_instances";
             free(lo_insts); free(hi_insts); free(divs);
             continue;
         }
@@ -1321,6 +1407,7 @@ static void *split_analysis_worker(void *arg)
                                              &hi_cons);
 
         if (lo_clen <= 0 || hi_clen <= 0) {
+            res->decision = "error_subset_consensus";
             free(lo_insts); free(hi_insts);
             free(lo_cons); free(hi_cons);
             continue;
@@ -1331,6 +1418,7 @@ static void *split_analysis_worker(void *arg)
         memcpy(&orig_copy, fam, sizeof(CandidateFamily));
         mdl_score_family(&orig_copy, w->genome_len, w->num_families);
         double orig_score = orig_copy.mdl_score;
+        res->orig_score = orig_score;
 
         /* Create temporary sub-families and score them */
         CandidateFamily sub_lo, sub_hi;
@@ -1352,12 +1440,24 @@ static void *split_analysis_worker(void *arg)
         mdl_score_family(&sub_lo, w->genome_len, w->num_families + 1);
         mdl_score_family(&sub_hi, w->genome_len, w->num_families + 1);
         double split_score = sub_lo.mdl_score + sub_hi.mdl_score;
+        res->lo_mdl_score = sub_lo.mdl_score;
+        res->hi_mdl_score = sub_hi.mdl_score;
+        res->lo_clen = lo_clen;
+        res->hi_clen = hi_clen;
+        res->split_score = split_score;
 
-        if (split_score <= orig_score) {
+        /* Relaxed gate (chr4 90×80 experiment 2026-05-02): for positive
+         * original families, accept non-negative combined split MDL.  The
+         * original strict gate required split>=orig and rejected all attempted
+         * chr4 splits. */
+        double min_acceptable = (orig_score > 0) ? 0.0 : orig_score - 2.0 * fabs(orig_score);
+        res->min_acceptable = min_acceptable;
+        if (split_score < min_acceptable) {
+            res->decision = "reject_mdl_gate";
             if (w->verbose >= 2)
-                fprintf(stderr, "  [split] F%d: rejected: split MDL gain <= 0 "
+                fprintf(stderr, "  [split] F%d: rejected: split MDL < min %.1f "
                         "(orig=%.1f, split=%.1f=%.1f+%.1f, n=%d)\n",
-                        fam->id, orig_score, split_score,
+                        fam->id, min_acceptable, orig_score, split_score,
                         sub_lo.mdl_score, sub_hi.mdl_score,
                         fam->num_instances);
             free(lo_cons); free(hi_cons);
@@ -1374,6 +1474,7 @@ static void *split_analysis_worker(void *arg)
 
         /* Store accepted result */
         res->valid = 1;
+        res->decision = "accept";
         res->lo_insts = lo_insts;
         res->n_lo = n_lo;
         res->lo_cons = lo_cons;
@@ -1439,11 +1540,23 @@ int refine_split_families(CandidateList *cl, const Genome *genome,
     /* --- Sequential fallback (num_threads <= 1) --- */
     if (num_threads <= 1) {
         int n_splits = 0;
+        FILE *audit_fp = split_audit_open();
 
         for (int fi = 0; fi < orig_n; fi++) {
             CandidateFamily *fam = &cl->families[fi];
+            SplitResult audit;
+            memset(&audit, 0, sizeof(audit));
+            audit.family_idx = fi;
+            audit.audited = 1;
+            audit.family_id = fam->id;
+            audit.consensus_length = fam->consensus_length;
+            audit.num_instances = fam->num_instances;
+            audit.decision = "not_evaluated";
+            audit.valley_pass = 1;
 
             if (fam->num_instances < REFINE_MIN_SPLIT_INSTANCES) {
+                audit.decision = "skip_too_few_instances";
+                split_audit_write_result(audit_fp, &audit);
                 if (verbose >= 2)
                     fprintf(stderr, "  [split] F%d: skipped: n_instances=%d < "
                             "REFINE_MIN_SPLIT_INSTANCES=%d\n",
@@ -1453,7 +1566,11 @@ int refine_split_families(CandidateList *cl, const Genome *genome,
 
             /* Collect divergence values */
             float *divs = malloc((size_t)fam->num_instances * sizeof(float));
-            if (!divs) continue;
+            if (!divs) {
+                audit.decision = "error_alloc_divs";
+                split_audit_write_result(audit_fp, &audit);
+                continue;
+            }
             for (int j = 0; j < fam->num_instances; j++)
                 divs[j] = fam->instances[j].divergence;
 
@@ -1462,8 +1579,13 @@ int refine_split_families(CandidateList *cl, const Genome *genome,
             int valley_pass;
             float threshold = otsu_threshold(divs, fam->num_instances,
                                              &bimodality, &valley_pass);
+            audit.threshold = threshold;
+            audit.bimodality = bimodality;
+            audit.valley_pass = valley_pass;
 
             if (bimodality < REFINE_BIMODALITY_THRESH) {
+                audit.decision = "reject_bimodality";
+                split_audit_write_result(audit_fp, &audit);
                 if (verbose >= 2)
                     fprintf(stderr, "  [split] F%d: rejected: bimodality=%.3f < "
                             "threshold=%.3f (n=%d)\n",
@@ -1475,6 +1597,8 @@ int refine_split_families(CandidateList *cl, const Genome *genome,
 
             /* Valley depth check */
             if (!valley_pass) {
+                audit.decision = "reject_valley";
+                split_audit_write_result(audit_fp, &audit);
                 if (verbose >= 2)
                     fprintf(stderr, "  [split] F%d: rejected: valley not deep enough "
                             "(bimodality=%.3f, n=%d)\n",
@@ -1489,9 +1613,13 @@ int refine_split_families(CandidateList *cl, const Genome *genome,
                 if (divs[j] <= threshold) n_lo++;
                 else n_hi++;
             }
+            audit.n_lo = n_lo;
+            audit.n_hi = n_hi;
 
             if (n_lo < REFINE_MIN_CLUSTER_SIZE ||
                 n_hi < REFINE_MIN_CLUSTER_SIZE) {
+                audit.decision = "reject_cluster_size";
+                split_audit_write_result(audit_fp, &audit);
                 if (verbose >= 2)
                     fprintf(stderr, "  [split] F%d: rejected: n_lo=%d or n_hi=%d < "
                             "REFINE_MIN_CLUSTER_SIZE=%d (threshold=%.3f, n=%d)\n",
@@ -1509,8 +1637,13 @@ int refine_split_families(CandidateList *cl, const Genome *genome,
             }
             mean_lo /= n_lo;
             mean_hi /= n_hi;
+            audit.mean_lo = mean_lo;
+            audit.mean_hi = mean_hi;
+            audit.div_gap = mean_hi - mean_lo;
 
             if (mean_hi - mean_lo < REFINE_MIN_DIV_GAP) {
+                audit.decision = "reject_div_gap";
+                split_audit_write_result(audit_fp, &audit);
                 if (verbose >= 2)
                     fprintf(stderr, "  [split] F%d: rejected: div_gap=%.3f < "
                             "REFINE_MIN_DIV_GAP=%.3f (mean_lo=%.3f mean_hi=%.3f, n=%d)\n",
@@ -1524,6 +1657,8 @@ int refine_split_families(CandidateList *cl, const Genome *genome,
             Instance *lo_insts = malloc((size_t)n_lo * sizeof(Instance));
             Instance *hi_insts = malloc((size_t)n_hi * sizeof(Instance));
             if (!lo_insts || !hi_insts) {
+                audit.decision = "error_alloc_split_instances";
+                split_audit_write_result(audit_fp, &audit);
                 free(lo_insts); free(hi_insts); free(divs);
                 continue;
             }
@@ -1545,6 +1680,10 @@ int refine_split_families(CandidateList *cl, const Genome *genome,
                                                  &hi_cons);
 
             if (lo_clen <= 0 || hi_clen <= 0) {
+                audit.decision = "error_subset_consensus";
+                audit.lo_clen = lo_clen;
+                audit.hi_clen = hi_clen;
+                split_audit_write_result(audit_fp, &audit);
                 free(lo_insts); free(hi_insts);
                 free(lo_cons); free(hi_cons);
                 continue;
@@ -1553,6 +1692,7 @@ int refine_split_families(CandidateList *cl, const Genome *genome,
             /* Score original family */
             mdl_score_family(fam, genome_len, num_families);
             double orig_score = fam->mdl_score;
+            audit.orig_score = orig_score;
 
             /* Create temporary sub-families and score them */
             CandidateFamily sub_lo, sub_hi;
@@ -1574,12 +1714,23 @@ int refine_split_families(CandidateList *cl, const Genome *genome,
             mdl_score_family(&sub_lo, genome_len, num_families + 1);
             mdl_score_family(&sub_hi, genome_len, num_families + 1);
             double split_score = sub_lo.mdl_score + sub_hi.mdl_score;
+            audit.lo_mdl_score = sub_lo.mdl_score;
+            audit.hi_mdl_score = sub_hi.mdl_score;
+            audit.lo_clen = lo_clen;
+            audit.hi_clen = hi_clen;
+            audit.split_score = split_score;
 
-            if (split_score <= orig_score) {
+            /* Relaxed gate (chr4 90×80 experiment 2026-05-02): for positive
+             * original families, accept non-negative combined split MDL. */
+            double min_acceptable = (orig_score > 0) ? 0.0 : orig_score - 2.0 * fabs(orig_score);
+            audit.min_acceptable = min_acceptable;
+            if (split_score < min_acceptable) {
+                audit.decision = "reject_mdl_gate";
+                split_audit_write_result(audit_fp, &audit);
                 if (verbose >= 2)
-                    fprintf(stderr, "  [split] F%d: rejected: split MDL gain <= 0 "
+                    fprintf(stderr, "  [split] F%d: rejected: split MDL < min %.1f "
                             "(orig=%.1f, split=%.1f=%.1f+%.1f, n=%d)\n",
-                            fam->id, orig_score, split_score,
+                            fam->id, min_acceptable, orig_score, split_score,
                             sub_lo.mdl_score, sub_hi.mdl_score,
                             fam->num_instances);
                 free(lo_cons); free(hi_cons);
@@ -1588,6 +1739,9 @@ int refine_split_families(CandidateList *cl, const Genome *genome,
             }
 
             /* Accept split */
+            audit.decision = "accept";
+            audit.valid = 1;
+            split_audit_write_result(audit_fp, &audit);
             if (verbose >= 2)
                 fprintf(stderr, "  [split] F%d: accepted: split into n_lo=%d / n_hi=%d "
                         "at threshold=%.3f (div %.1f%% / %.1f%%), MDL %.1f -> %.1f\n",
@@ -1646,6 +1800,7 @@ int refine_split_families(CandidateList *cl, const Genome *genome,
             n_splits++;
         }
 
+        if (audit_fp) fclose(audit_fp);
         return n_splits;
     }
 
@@ -1688,6 +1843,15 @@ int refine_split_families(CandidateList *cl, const Genome *genome,
         free(threads);
     } else {
         split_analysis_worker(&sa_args);
+    }
+
+    {
+        FILE *audit_fp = split_audit_open();
+        if (audit_fp) {
+            for (int fi = 0; fi < orig_n; fi++)
+                split_audit_write_result(audit_fp, &results[fi]);
+            fclose(audit_fp);
+        }
     }
 
     /* --- Phase 2a: sequential apply of accepted splits --- */
@@ -1943,8 +2107,9 @@ static int64_t prune_count_other_coverage(const PruneInterval *iv, int n,
  * computes per-family "exclusive bp per instance" using sorted
  * intervals + binary search rather than an O(genome_len) bitmap.
  *
- * The function returns the number of pruned families (and zeros
- * their mdl_score in place).  Memory footprint is O(num_intervals),
+ * The function returns the number of pruned families (and marks their
+ * acceptance state as pruned, while zeroing the legacy mdl_score alias).
+ * Memory footprint is O(num_intervals),
  * NOT O(genome_len) — so it scales to multi-Gbp genomes such as
  * wheat (17 Gb) without a single fatal allocation.
  */
@@ -1954,7 +2119,7 @@ int refine_prune_families_sweepline(CandidateList *cl, glen_t genome_len,
     /* Count accepted families */
     int n_accepted = 0;
     for (int i = 0; i < cl->num_families; i++)
-        if (cl->families[i].mdl_score > 0) n_accepted++;
+        if (candidate_is_accepted(&cl->families[i])) n_accepted++;
 
     if (n_accepted <= 1) return 0;
 
@@ -1967,9 +2132,9 @@ int refine_prune_families_sweepline(CandidateList *cl, glen_t genome_len,
 
     int oi = 0;
     for (int i = 0; i < cl->num_families; i++) {
-        if (cl->families[i].mdl_score > 0) {
+        if (candidate_is_accepted(&cl->families[i])) {
             order[oi].idx = i;
-            order[oi].score = cl->families[i].mdl_score;
+            order[oi].score = candidate_report_score(&cl->families[i]);
             oi++;
         }
     }
@@ -1989,7 +2154,7 @@ int refine_prune_families_sweepline(CandidateList *cl, glen_t genome_len,
      * for subsequent candidates. */
     int64_t total_intervals = 0;
     for (int i = 0; i < cl->num_families; i++) {
-        if (cl->families[i].mdl_score <= 0) continue;
+        if (!candidate_is_accepted(&cl->families[i])) continue;
         total_intervals += cl->families[i].num_instances;
     }
 
@@ -2008,7 +2173,7 @@ int refine_prune_families_sweepline(CandidateList *cl, glen_t genome_len,
     int64_t ii = 0;
     gpos_t  max_len = 0;
     for (int i = 0; i < cl->num_families; i++) {
-        if (cl->families[i].mdl_score <= 0) continue;
+        if (!candidate_is_accepted(&cl->families[i])) continue;
         CandidateFamily *f = &cl->families[i];
         for (int j = 0; j < f->num_instances; j++) {
             gpos_t s = f->instances[j].position;
@@ -2034,7 +2199,7 @@ int refine_prune_families_sweepline(CandidateList *cl, glen_t genome_len,
     for (int k = 0; k < n_accepted; k++) {
         int fi = order[k].idx;
         CandidateFamily *f = &cl->families[fi];
-        if (f->mdl_score <= 0) continue; /* defensive */
+        if (!candidate_is_accepted(f)) continue; /* defensive */
         if (pruned[fi]) continue;        /* defensive */
 
         double exclusive_savings = 0;
@@ -2068,7 +2233,7 @@ int refine_prune_families_sweepline(CandidateList *cl, glen_t genome_len,
             exclusive_instances++;
         }
 
-        double exclusive_score = exclusive_savings - f->model_cost;
+        double exclusive_score = exclusive_savings - candidate_model_cost(f);
 
         if (exclusive_instances == 0) {
             /* No instance has >=25% exclusive coverage — purely redundant.
@@ -2077,10 +2242,14 @@ int refine_prune_families_sweepline(CandidateList *cl, glen_t genome_len,
             if (verbose)
                 fprintf(stderr, "  Pruned F%d: excl_score=%.1f "
                         "(model=%.1f, excl_inst=%d)\n",
-                        f->id, exclusive_score, f->model_cost,
+                        f->id, exclusive_score, candidate_model_cost(f),
                         exclusive_instances);
             pruned[fi] = 1;
             f->mdl_score = 0;
+            f->mdl.report_score = 0.0;
+            f->mdl.accept_state = CAND_ACCEPT_PRUNED;
+            f->mdl.quality_tier = CAND_TIER_REJECT;
+            f->mdl.quality_flags |= CAND_QF_PRUNED_REDUNDANT;
             n_pruned++;
         }
     }
@@ -2740,7 +2909,7 @@ int refine_coalesce_tandem_instances(CandidateList *cl,
 
     for (int fi = 0; fi < cl->num_families; fi++) {
         CandidateFamily *f = &cl->families[fi];
-        if (f->mdl_score <= 0.0)    continue;
+        if (!candidate_is_accepted(f)) continue;
         if (f->num_instances <= 1)  continue;
 
         int gap_threshold = (int)(coalesce_factor * (float)f->consensus_length);
@@ -2843,4 +3012,3 @@ int refine_coalesce_tandem_instances(CandidateList *cl,
     }
     return total_coalesced;
 }
-

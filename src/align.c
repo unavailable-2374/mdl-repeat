@@ -474,27 +474,22 @@ static AlignedInstance align_banded(const CandidateFamily *fam,
 }
 
 /* ================================================================
- * Step 4a: BLAST-based instance recruitment for short families
+ * Step 4a: RMBlast-based instance recruitment for short families
  * ================================================================ */
 
 /*
- * Detect blastn in PATH.  Checks the PGTA conda env first, then PATH.
+ * Resolve rmblastn: honor $RMBLASTN_BIN if set, otherwise find it on PATH.
  * Returns a malloc'd path string on success, NULL if not found.
  * Caller must free() the returned string.
  */
-static char *find_blastn(void)
+static char *find_rmblastn(void)
 {
-    /* Preferred: PGTA conda env (known-good version) */
-    static const char *candidates[] = {
-        "/home/shuoc/tool/miniconda3/envs/PGTA/bin/blastn",
-        NULL
-    };
-    for (int i = 0; candidates[i]; i++) {
-        if (access(candidates[i], X_OK) == 0)
-            return align_strdup(candidates[i]);
-    }
-    /* Fall back to PATH via 'which blastn' */
-    FILE *fp = popen("which blastn 2>/dev/null", "r");
+    /* Explicit override (e.g. set by the conda package or the user) */
+    const char *env = getenv("RMBLASTN_BIN");
+    if (env && *env && access(env, X_OK) == 0)
+        return align_strdup(env);
+    /* Resolve rmblastn from PATH via 'which' */
+    FILE *fp = popen("which rmblastn 2>/dev/null", "r");
     if (!fp) return NULL;
     char buf[512];
     buf[0] = '\0';
@@ -510,25 +505,25 @@ static char *find_blastn(void)
     return NULL;
 }
 
-/* Cached blastn path result: 0 = unchecked, 1 = found (g_blastn_path set),
+/* Cached rmblastn path result: 0 = unchecked, 1 = found (g_rmblastn_path set),
  * -1 = not available.  Protected by a simple flag (called from parallel
  * threads, but all threads do the same idempotent check; worst case the
  * check runs multiple times which is harmless). */
-static volatile int g_blastn_checked = 0;
-static char *g_blastn_path = NULL;
+static volatile int g_rmblastn_checked = 0;
+static char *g_rmblastn_path = NULL;
 
-static int blastn_available(void)
+static int rmblastn_available(void)
 {
-    if (g_blastn_checked == 0) {
-        char *p = find_blastn();
+    if (g_rmblastn_checked == 0) {
+        char *p = find_rmblastn();
         if (p) {
-            g_blastn_path = p;
-            g_blastn_checked = 1;
+            g_rmblastn_path = p;
+            g_rmblastn_checked = 1;
         } else {
-            g_blastn_checked = -1;
+            g_rmblastn_checked = -1;
         }
     }
-    return (g_blastn_checked == 1);
+    return (g_rmblastn_checked == 1);
 }
 
 /*
@@ -564,9 +559,28 @@ static int write_genome_fasta(const Genome *genome, const char *path,
     return 0;
 }
 
-/* BLAST_SHORT_THRESHOLD and BLAST_MIN_PIDENT used by batch recruitment below */
-#define BLAST_SHORT_THRESHOLD  500
-#define BLAST_MIN_PIDENT       70.0f
+/*
+ * RMBlast recruitment is a bounded supplemental pass for short consensuses.
+ * It is not a replacement for the k-mer + banded-DP refinement path:
+ * parameters are chosen to recover divergent full/near-full short instances
+ * without admitting seed-sized local hits.
+ *
+ * RepeatMasker/RepeatModeler use rmblastn's repeat-aware task with small
+ * word seeds.  We follow that direction, but keep identity/coverage gates
+ * explicit because this pipeline scores accepted instances with its own MDL
+ * model rather than RepeatMasker's SW score model.  Do not enable
+ * RepeatMasker's query-domain masklevel filtering here: it intentionally
+ * suppresses overlapping hits on the same consensus query, while this pass
+ * needs to recover all genomic instances for downstream duplicate/overlap
+ * filtering in mdl-repeat.
+ */
+#define RMBLAST_SHORT_THRESHOLD  500
+#define RMBLAST_MIN_PIDENT       70.0f
+#define RMBLAST_MIN_QCOV_HSP     60.0f
+#define RMBLAST_WORD_SIZE        7
+#define RMBLAST_GAPOPEN          12
+#define RMBLAST_GAPEXTEND        2
+#define RMBLAST_MAX_HSPS         1000000
 
 
 /* ================================================================
@@ -1285,7 +1299,7 @@ void align_refine_all(CandidateList *cl, const Genome *genome,
 }
 
 /* ================================================================
- * Batch BLAST recruitment for short families
+ * Batch RMBlast recruitment for short families
  * ================================================================ */
 
 /*
@@ -1343,22 +1357,22 @@ int align_blast_recruit_short_families(CandidateList *cl,
                                         const Genome *genome, int k,
                                         int verbose)
 {
-    if (!blastn_available()) return -1;
+    if (!rmblastn_available()) return -1;
 
-    /* Identify families with consensus_length < BLAST_SHORT_THRESHOLD */
+    /* Identify families with consensus_length < RMBLAST_SHORT_THRESHOLD */
     int n_short = 0;
     for (int i = 0; i < cl->num_families; i++) {
         CandidateFamily *f = &cl->families[i];
-        if (f->consensus && f->consensus_length < BLAST_SHORT_THRESHOLD
+        if (f->consensus && f->consensus_length < RMBLAST_SHORT_THRESHOLD
                          && f->consensus_length >= k)
             n_short++;
     }
     if (n_short == 0) return 0;
 
     if (verbose)
-        fprintf(stderr, "  BLAST recruitment: %d short families (<%d bp) — "
-                "running batch dc-megablast...\n",
-                n_short, BLAST_SHORT_THRESHOLD);
+        fprintf(stderr, "  RMBlast recruitment: %d short families (<%d bp) — "
+                "running batch rmblastn with %s...\n",
+                n_short, RMBLAST_SHORT_THRESHOLD, g_rmblastn_path);
 
     /* Build temp file paths */
     int pid = (int)getpid();
@@ -1387,7 +1401,7 @@ int align_blast_recruit_short_families(CandidateList *cl,
         for (int i = 0; i < cl->num_families; i++) {
             CandidateFamily *f = &cl->families[i];
             if (!f->consensus || f->consensus_length < k
-                               || f->consensus_length >= BLAST_SHORT_THRESHOLD)
+                               || f->consensus_length >= RMBLAST_SHORT_THRESHOLD)
                 continue;
             fprintf(fp, ">F%d\n", i);
             for (int j = 0; j < f->consensus_length; j++) {
@@ -1399,17 +1413,21 @@ int align_blast_recruit_short_families(CandidateList *cl,
         fclose(fp);
     }
 
-    /* Run single blastn for all short families */
+    /* Run single rmblastn for all short families */
     {
         char cmd[2048];
         snprintf(cmd, sizeof(cmd),
-                 "%s -task dc-megablast -query %s -subject %s "
+                 "%s -task rmblastn -query %s -subject %s "
                  "-outfmt \"6 qseqid sseqid sstart send pident length "
                  "qstart qend evalue sstrand\" "
-                 "-perc_identity %.1f -dust no "
+                 "-word_size %d -perc_identity %.1f -qcov_hsp_perc %.1f "
+                 "-gapopen %d -gapextend %d "
+                 "-max_hsps %d -dust no "
                  "-out %s 2>/dev/null",
-                 g_blastn_path, query_fa, subj_fa,
-                 (double)BLAST_MIN_PIDENT,
+                 g_rmblastn_path, query_fa, subj_fa,
+                 RMBLAST_WORD_SIZE, (double)RMBLAST_MIN_PIDENT,
+                 (double)RMBLAST_MIN_QCOV_HSP,
+                 RMBLAST_GAPOPEN, RMBLAST_GAPEXTEND, RMBLAST_MAX_HSPS,
                  out_tab);
         system(cmd);  /* non-zero exit = no hits, not a hard error */
     }
@@ -1441,7 +1459,7 @@ int align_blast_recruit_short_families(CandidateList *cl,
         if (!fam->consensus) continue;
 
         /* Filters */
-        if (pident < (double)BLAST_MIN_PIDENT) continue;
+        if (pident < (double)RMBLAST_MIN_PIDENT) continue;
         if (length < (long long)k) continue;
 
         /* Strand */
@@ -1508,7 +1526,7 @@ int align_blast_recruit_short_families(CandidateList *cl,
     rc = total_added;
 
     if (verbose)
-        fprintf(stderr, "  BLAST recruitment: added %d instances across %d families\n",
+        fprintf(stderr, "  RMBlast recruitment: added %d instances across %d families\n",
                 total_added, n_short);
 
 cleanup:

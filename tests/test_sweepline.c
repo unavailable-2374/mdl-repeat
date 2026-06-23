@@ -166,7 +166,7 @@ static void test_mdl_select_small(void)
     uint8_t *ref = calloc((size_t)genome_len, 1);
     int64_t ref_covered = 0;
     for (int i = 0; i < cl.num_families; i++) {
-        if (cl.families[i].mdl_score <= 0) continue;
+        if (!candidate_is_accepted(&cl.families[i])) continue;
         for (int j = 0; j < cl.families[i].num_instances; j++) {
             gpos_t s = cl.families[i].instances[j].position;
             gpos_t e = s + (gpos_t)cl.families[i].instances[j].aligned_length;
@@ -269,6 +269,12 @@ static void test_refine_prune_small(void)
     cl.families[0].model_cost = 50.0;
     cl.families[1].model_cost = 50.0;
     cl.families[2].model_cost = 50.0;
+    for (int i = 0; i < 3; i++) {
+        cl.families[i].mdl.report_score = cl.families[i].mdl_score;
+        cl.families[i].mdl.model_cost = cl.families[i].model_cost;
+        cl.families[i].mdl.accept_state = CAND_ACCEPT_EXCLUSIVE;
+        cl.families[i].mdl.quality_tier = CAND_TIER_CORE;
+    }
 
     glen_t genome_len = 100000;
     int n_pruned = refine_prune_families_sweepline(&cl, genome_len, 0, 3);
@@ -283,6 +289,8 @@ static void test_refine_prune_small(void)
           "exactly 1 family pruned (got %d)", n_pruned);
     CHECK(cl.families[0].mdl_score == 0.0,
           "F0 (weakest, fully overlapping with F1) pruned");
+    CHECK(cl.families[0].mdl.accept_state == CAND_ACCEPT_PRUNED,
+          "F0 acceptance state marked pruned");
     CHECK(cl.families[1].mdl_score > 0.0,
           "F1 (overlapping with F0 but stronger score) retained");
     CHECK(cl.families[2].mdl_score > 0.0,
@@ -319,6 +327,12 @@ static void test_refine_prune_large_genome(void)
     cl.families[0].model_cost = 50.0;
     cl.families[1].model_cost = 50.0;
     cl.families[2].model_cost = 50.0;
+    for (int i = 0; i < 3; i++) {
+        cl.families[i].mdl.report_score = cl.families[i].mdl_score;
+        cl.families[i].mdl.model_cost = cl.families[i].model_cost;
+        cl.families[i].mdl.accept_state = CAND_ACCEPT_EXCLUSIVE;
+        cl.families[i].mdl.quality_tier = CAND_TIER_CORE;
+    }
 
     glen_t big = (glen_t)4 * 1000 * 1000 * 1000;
     int n_pruned = refine_prune_families_sweepline(&cl, big, 0, 3);
@@ -374,6 +388,10 @@ static void test_refine_prune_scale(void)
                     200, 5);
         cl.families[i].mdl_score = (double)(i + 1);  /* distinct scores */
         cl.families[i].model_cost = 50.0;
+        cl.families[i].mdl.report_score = cl.families[i].mdl_score;
+        cl.families[i].mdl.model_cost = cl.families[i].model_cost;
+        cl.families[i].mdl.accept_state = CAND_ACCEPT_EXCLUSIVE;
+        cl.families[i].mdl.quality_tier = CAND_TIER_CORE;
     }
 
     int64_t before = rss_bytes();

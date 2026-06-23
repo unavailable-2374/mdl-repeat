@@ -8,8 +8,8 @@
 
 /*
  * Write accepted repeat families to FASTA.
- * Header: >R=<id> length=<len> copies=<n> mdl=<score>
- * Only writes families with mdl_score > 0.
+ * Header: >R=<id> length=<len> copies=<n> mdl=<score> ...
+ * Only writes families accepted by CandidateFamily.mdl.accept_state.
  */
 int output_fasta(const char *filename, const CandidateList *cl);
 
@@ -24,7 +24,7 @@ int output_bed(const char *filename, const CandidateList *cl,
 /*
  * Write per-family statistics to TSV.
  * Columns: id, consensus_length, num_instances, divergence_mean,
- *          mdl_score, model_cost, topology
+ *          mdl_score, model_cost, topology, MDL provenance, quality state
  */
 int output_stats(const char *filename, const CandidateList *cl);
 

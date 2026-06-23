@@ -22,12 +22,15 @@ mdl-repeat identifies repetitive element families in genomic DNA sequences witho
 - No external libraries at build time (only `libm` and pthreads)
 
 **Optional runtime dependency:**
-- `blastn` (BLAST+ ≥ 2.12) — for BLAST-based instance recruitment of short
+- `rmblastn` (RMBlast) — for BLAST-based instance recruitment of short
   families (consensus length < 500 bp). When present in PATH or at
-  `/home/shuoc/tool/miniconda3/envs/PGTA/bin/blastn`, `dc-megablast` is used
-  for improved sensitivity on short divergent elements. Falls back to the
-  built-in k-mer + banded DP path if blastn is not found. Install via:
-  `conda install -c bioconda blast` or `apt install ncbi-blast+`.
+  `/home/shuoc/tool/miniconda3/envs/PGTA/bin/rmblastn`, the repeat-aware
+  `rmblastn` task is used with a small word seed (`-word_size 7`),
+  RepeatMasker-style default gap costs (`-gapopen 12 -gapextend 2`),
+  `-perc_identity 70`, and `-qcov_hsp_perc 60` for bounded short-element
+  recruitment. Falls back to the
+  built-in k-mer + banded DP path if rmblastn is not found. Install via:
+  `conda install -c bioconda rmblast`.
 
 ## Build
 

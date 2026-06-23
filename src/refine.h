@@ -47,10 +47,13 @@
  * Increase to 50M for long TE families (ERV, Helitron). */
 extern int64_t g_refine_max_dp_cells;
 
+/* Optional split-stage audit TSV path.  NULL disables audit output. */
+extern const char *g_refine_split_audit_path;
+
 /* Splitting parameters */
-#define REFINE_MIN_SPLIT_INSTANCES  10   /* minimum instances to attempt split */
+#define REFINE_MIN_SPLIT_INSTANCES  3    /* minimum instances (chr4 push experiment 2026-05-02; was 5, was 10) */
 #define REFINE_MIN_CLUSTER_SIZE      3   /* minimum instances per sub-family */
-#define REFINE_MIN_DIV_GAP        0.05f  /* min mean divergence difference for split */
+#define REFINE_MIN_DIV_GAP        0.03f  /* min mean divergence difference for split (lowered from 0.05 — chr4 90×80 experiment 2026-05-02) */
 #define REFINE_BIMODALITY_THRESH  0.20f  /* min inter-class/total variance ratio */
 #define REFINE_DIV_BINS            100   /* histogram bins for Otsu's method */
 
@@ -66,7 +69,9 @@ int refine_merge_families(CandidateList *cl, const Genome *genome,
 
 /*
  * Split families with bimodal divergence distribution into subfamilies.
- * Uses Otsu's method to detect bimodality, accepts split only if MDL improves.
+ * Uses Otsu's method to detect bimodality.  The current relaxed gate accepts
+ * non-negative combined split MDL for positive-score originals; quality
+ * classification is handled downstream.
  * Called before MDL selection (operates on all families).
  * num_families is the current R estimate for MDL scoring.
  * Returns number of splits performed.

@@ -15,10 +15,31 @@ int output_fasta(const char *filename, const CandidateList *cl)
     int written = 0;
     for (int i = 0; i < cl->num_families; i++) {
         CandidateFamily *f = &cl->families[i];
-        if (f->mdl_score <= 0) continue;
+        if (!candidate_is_accepted(f)) continue;
 
-        fprintf(fp, ">R=%d length=%d copies=%d mdl=%.1f\n",
-                f->id, f->consensus_length, f->num_instances, f->mdl_score);
+        /* Mean instance divergence — surfaces a per-family identity signal
+         * downstream tools (Refiner_mdl) need without re-parsing the stats TSV. */
+        float avg_div = 0.0f;
+        for (int j = 0; j < f->num_instances; j++)
+            avg_div += f->instances[j].divergence;
+        if (f->num_instances > 0) avg_div /= (float)f->num_instances;
+
+        const char *topo = (f->topology == TOPO_LINEAR) ? "linear" :
+                           (f->topology == TOPO_CYCLIC) ? "cyclic" : "complex";
+        char qflags[256];
+        candidate_quality_flags_string(f->mdl.quality_flags, qflags,
+                                       sizeof(qflags));
+
+        /* Header schema (v6.1+): backward-compatible — older parsers that
+         * only match `>R=N length=L copies=C mdl=M` still succeed; new
+         * fields `div=` and `topo=` are appended. */
+        fprintf(fp, ">R=%d length=%d copies=%d mdl=%.1f div=%.3f topo=%s "
+                    "accept=%s tier=%s flags=0x%08x qflags=%s\n",
+                f->id, f->consensus_length, f->num_instances,
+                candidate_report_score(f), avg_div, topo,
+                candidate_accept_state_name(f->mdl.accept_state),
+                candidate_quality_tier_name(f->mdl.quality_tier),
+                (unsigned)f->mdl.quality_flags, qflags);
 
         for (int j = 0; j < f->consensus_length; j++) {
             fputc(num_to_char(f->consensus[j]), fp);
@@ -46,7 +67,7 @@ int output_bed(const char *filename, const CandidateList *cl,
     int written = 0;
     for (int i = 0; i < cl->num_families; i++) {
         CandidateFamily *f = &cl->families[i];
-        if (f->mdl_score <= 0) continue;
+        if (!candidate_is_accepted(f)) continue;
 
         for (int j = 0; j < f->num_instances; j++) {
             Instance *inst = &f->instances[j];
@@ -97,7 +118,10 @@ int output_stats(const char *filename, const CandidateList *cl)
 
     /* Header */
     fprintf(fp, "family_id\tconsensus_length\tnum_instances\t"
-                "divergence_mean\tmdl_score\tmodel_cost\ttopology\n");
+                "divergence_mean\tmdl_score\tmodel_cost\ttopology\t"
+                "standalone_score\texclusive_score\texclusive_bases\t"
+                "exclusive_instances\tacceptance\tquality_tier\tquality_flags\t"
+                "quality_notes\n");
 
     int written = 0;
     for (int i = 0; i < cl->num_families; i++) {
@@ -110,10 +134,19 @@ int output_stats(const char *filename, const CandidateList *cl)
 
         const char *topo = (f->topology == TOPO_LINEAR) ? "linear" :
                            (f->topology == TOPO_CYCLIC) ? "cyclic" : "complex";
+        char qflags[256];
+        candidate_quality_flags_string(f->mdl.quality_flags, qflags,
+                                       sizeof(qflags));
 
-        fprintf(fp, "%d\t%d\t%d\t%.4f\t%.1f\t%.1f\t%s\n",
+        fprintf(fp, "%d\t%d\t%d\t%.4f\t%.1f\t%.1f\t%s\t"
+                    "%.1f\t%.1f\t%" PRId64 "\t%d\t%s\t%s\t0x%08x\t%s\n",
                 f->id, f->consensus_length, f->num_instances,
-                avg_div, f->mdl_score, f->model_cost, topo);
+                avg_div, candidate_report_score(f), candidate_model_cost(f), topo,
+                f->mdl.standalone_score, f->mdl.exclusive_score,
+                f->mdl.exclusive_bases, f->mdl.exclusive_instances,
+                candidate_accept_state_name(f->mdl.accept_state),
+                candidate_quality_tier_name(f->mdl.quality_tier),
+                (unsigned)f->mdl.quality_flags, qflags);
         written++;
     }
 

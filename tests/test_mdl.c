@@ -221,13 +221,26 @@ static void test_select_unique_coverage(void)
     CHECK(r.compression_ratio >= 0.0 && r.compression_ratio <= 1.0,
           "compression_ratio in [0,1] (got %.4f)", r.compression_ratio);
     /* No family should have its score zeroed: both pass standalone gate. */
-    int n_pos = 0, n_zero = 0;
+    int n_pos = 0, n_zero = 0, n_exclusive = 0, n_standalone = 0;
+    int n_warn = 0, n_fallback_flag = 0, n_no_exclusive_flag = 0;
     for (int i = 0; i < cl.num_families; i++) {
         if (cl.families[i].mdl_score >  0.0) n_pos++;
         if (cl.families[i].mdl_score == 0.0) n_zero++;
+        if (cl.families[i].mdl.accept_state == CAND_ACCEPT_EXCLUSIVE) n_exclusive++;
+        if (cl.families[i].mdl.accept_state == CAND_ACCEPT_STANDALONE) n_standalone++;
+        if (cl.families[i].mdl.quality_tier == CAND_TIER_WARN) n_warn++;
+        if (cl.families[i].mdl.quality_flags & CAND_QF_STANDALONE_FALLBACK)
+            n_fallback_flag++;
+        if (cl.families[i].mdl.quality_flags & CAND_QF_NO_EXCLUSIVE_BASES)
+            n_no_exclusive_flag++;
     }
     CHECK(n_pos == 2 && n_zero == 0,
           "score: 2 positive + 0 zero (got %d / %d)", n_pos, n_zero);
+    CHECK(n_exclusive == 1 && n_standalone == 1,
+          "acceptance provenance: 1 exclusive + 1 standalone (got %d / %d)",
+          n_exclusive, n_standalone);
+    CHECK(n_warn == 1 && n_fallback_flag == 1 && n_no_exclusive_flag == 1,
+          "quality provenance: standalone fallback marked warn with no-exclusive flag");
 
     /* bases_covered must NOT double-count overlap.  Total unique
      * positions = 3 * 200 = 600 (the two families occupy identical
@@ -273,13 +286,25 @@ static void test_select_unique_coverage_no_fallback(void)
     CHECK(r.num_accepted == 1,
           "n_inst=2 (below standalone-fallback threshold), "
           "identical positions → exactly 1 accepted (got %d)", r.num_accepted);
-    int n_pos = 0, n_zero = 0;
+    int n_pos = 0, n_zero = 0, n_exclusive = 0, n_rejected = 0;
+    int rejected_preserved_standalone = 0;
     for (int i = 0; i < cl.num_families; i++) {
         if (cl.families[i].mdl_score >  0.0) n_pos++;
         if (cl.families[i].mdl_score == 0.0) n_zero++;
+        if (cl.families[i].mdl.accept_state == CAND_ACCEPT_EXCLUSIVE) n_exclusive++;
+        if (cl.families[i].mdl.accept_state == CAND_ACCEPT_REJECTED) {
+            n_rejected++;
+            if (cl.families[i].mdl.standalone_score > 0.0)
+                rejected_preserved_standalone++;
+        }
     }
     CHECK(n_pos == 1 && n_zero == 1,
           "score rewrite: 1 positive + 1 zero (got %d / %d)", n_pos, n_zero);
+    CHECK(n_exclusive == 1 && n_rejected == 1,
+          "acceptance provenance: 1 exclusive + 1 rejected (got %d / %d)",
+          n_exclusive, n_rejected);
+    CHECK(rejected_preserved_standalone == 1,
+          "rejected overlapped family preserves positive standalone_score");
     CHECK(r.bases_covered == 400,
           "bases_covered == 400 (got %lld)", (long long)r.bases_covered);
 
@@ -314,6 +339,12 @@ static void test_select_disjoint_families(void)
           "bases_covered == 1200 (got %lld)", (long long)r.bases_covered);
     CHECK(r.compression_ratio >= 0.0 && r.compression_ratio <= 1.0,
           "compression_ratio in [0,1] (got %.4f)", r.compression_ratio);
+    CHECK(cl.families[0].mdl.quality_tier == CAND_TIER_CORE &&
+          cl.families[1].mdl.quality_tier == CAND_TIER_CORE,
+          "disjoint high-quality families remain core tier");
+    CHECK(cl.families[0].mdl.quality_flags == CAND_QF_NONE &&
+          cl.families[1].mdl.quality_flags == CAND_QF_NONE,
+          "disjoint high-quality families have no quality flags");
 
     free_family(&cl.families[0]);
     free_family(&cl.families[1]);

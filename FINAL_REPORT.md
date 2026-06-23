@@ -1,8 +1,19 @@
 # mdl-repeat — v6 Final Synthesis Report
 
-**Date**: 2026-05-01
+**Date**: 2026-05-01 (initial) / **2026-05-02 update** below
 **Scope**: Full mdl-repeat optimization session (Stage A → Stage B → Option K → v6 patches)
 **Status**: v6_final locked. All 22/22 + 34/34 + 17/17 tests green. Phase 5 attempted but reverted with documented cause.
+
+> **2026-05-02 UPDATE — Boundary Refinement Validated** (revised 2026-05-03/04)
+> A new bp-level improvement loop was empirically validated (TAIR10 nuclear):
+> bp-F1 0.5793 → **0.6056 (+2.63 pp)** with **precision IMPROVING** (0.7702 → 0.7727).
+> See [CHR4_REFINE_VICTORY.md](./CHR4_REFINE_VICTORY.md) for the full record. Two changes:
+> 1. `src/refine.{h,c}` — fully relaxed split-MDL gate (gate=0.0, both parallel and serial sites);
+>    0→878 splits accepted on TAIR10 (was 414 with parallel-only-0.5gate, 547 with both-0.3gate)
+> 2. `tools/refine_boundary.py` — iterated boundary-only consensus extension (7 iters to convergence)
+> Plus a stable bp-evaluator (`tools/eval_bp_stable.py`) that bypasses RepeatMasker's global-state
+> dedup, which was the methodological breakthrough enabling all the above (RM was producing -15pp
+> false-negative signals due to whole-library cross-match interference).
 
 ---
 
@@ -204,23 +215,36 @@ tests/test_mdl.c   |  345 ++++++++++-
 
 ## 7. Recommendations for Future Work
 
+> **Update 2026-05-01** — Refiner_mdl was empirically tested as a downstream
+> on TAIR10 nuclear and **does not improve recall** (full pipeline drops 80×80
+> from 0.821 → 0.231; even the polish-only Phase 1 contributes ≈ 0). See
+> [REFINER_MDL_BENCHMARK_RESULT.md](./REFINER_MDL_BENCHMARK_RESULT.md). The
+> recommendations below are revised accordingly: do not assume an external
+> polish stage will close mdl-repeat's open gaps — solutions need to live
+> inside mdl-repeat itself.
+
 ### High-leverage (next session candidate):
 - **F' with assembly-stage scaling guard**: re-introduce BLAST recruit for <500bp families, but cap fragment_assembly's per-family instance count to prevent O(n²) blowup. Test G fixtures already exist.
-- **chr4 90×80 gap analysis**: instrument the 40% of in-scope families failing 90% identity; likely root cause is consensus-rebuild trimming edges. May respond to a chr4-specific J' (conditional 20k cap only when consensus has stable matches at the boundary).
+- **chr4 90×80 gap analysis (mdl-repeat-internal)**: instrument the 40% of in-scope families failing 90% identity; likely root cause is consensus-rebuild trimming edges. The Refiner_mdl Phase 1 BLASTN+MAFFT polish was empirically tested and contributes ≈ 0 to 90×80 (TAIR10 baseline 0.6605 → polished 0.6427) — so this gap **must** be closed inside mdl-repeat (e.g., conditional re-extension with banded DP at lower stopping threshold for high-divergence high-copy families; chr4-specific J' with stability check at the boundary).
 
 ### Medium-leverage:
 - **BIO-N5 canonical strand orientation**: integrate UniProt RT/RH/IN domain DB; post-MDL flip step for ≥5kb consensuses. Library-utility polish, not recall-affecting.
 - **Genome C nested-merge bug**: separate ticket; tighten `nested_containment_fraction` for the pure structural-prefix case (uncovered by B+Q6's seq_index fix).
 
-### Low-leverage / explicitly rejected:
+### Low-leverage / explicitly rejected (now including Refiner_mdl-coupled ideas):
 - **G**: don't loosen merge length-ratio below 0.7 (confirmed by both reviewers across 4 rounds)
 - **H**: don't admit 2-copy families (out of design scope, FP risk in pericentric regions)
 - **I**: don't blanket-loosen max-divergence (HANDOFF §4 dead end; conditional version maybe with new evidence)
 - **D'**: don't redo multi-pass; was tested + reverted in this session
+- **Refiner_mdl as standard downstream**: empirically disproven 2026-05-01; `te_structure_filter` is incompatible with Helitron / MITE / SINE / novel families that mdl-repeat is designed to capture
+- **R4 / R9 (close Refiner_mdl Phase 0.4, emit merge log)**: depended on Refiner_mdl being the right downstream; cancelled
 
 ### Big-genome benchmarking:
 - **Run on maize**: 2.3 Gb plant genome with 85% TE content. v6 should now handle it (sweep-line memory + dynamic HASH_SIZE). Would establish whether mdl-repeat is competitive with EDTA on dense-TE plants.
 - **Run on wheat**: 17 Gb. v6 should also handle it but watch wall-clock — chunk-size needs tuning.
+
+### Optional library-cleanliness post-processing (separate from recall):
+- If a downstream user needs a smaller masking library (e.g., for RepeatMasker speed), apply only `Refiner_mdl.phase0_triage.hard_filter` (length ≥ 50, copies ≥ 2, entropy, DUST, N%) — costs **−1.4 pp** at 80×80 and removes 18% of marginal sequences. Do **not** chain to the rest of Refiner_mdl.
 
 ---
 
