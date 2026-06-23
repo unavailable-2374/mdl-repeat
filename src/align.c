@@ -7,7 +7,7 @@
 
 #include "align.h"
 
-/* Local strdup replacement to avoid _POSIX_C_SOURCE conflicts with uid_t */
+/* Local strdup replacement to avoid _POSIX_C_SOURCE conflicts with mdl_uid_t */
 static char *align_strdup(const char *s)
 {
     size_t n = strlen(s) + 1;

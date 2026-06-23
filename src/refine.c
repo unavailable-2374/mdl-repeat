@@ -993,7 +993,7 @@ int refine_merge_families(CandidateList *cl, const Genome *genome,
         if (cl->families[i].num_instances > 0) {
             if (write_idx != i)
                 cl->families[write_idx] = cl->families[i];
-            cl->families[write_idx].id = (uid_t)write_idx;
+            cl->families[write_idx].id = (mdl_uid_t)write_idx;
             write_idx++;
         } else {
             /* Free consensus of absorbed family */
@@ -1778,7 +1778,7 @@ int refine_split_families(CandidateList *cl, const Genome *genome,
 
             CandidateFamily *new_fam = &cl->families[cl->num_families];
             memset(new_fam, 0, sizeof(CandidateFamily));
-            new_fam->id = (uid_t)cl->num_families;
+            new_fam->id = (mdl_uid_t)cl->num_families;
             new_fam->consensus = hi_cons;
             new_fam->consensus_length = hi_clen;
             new_fam->instances = hi_insts;
@@ -1916,7 +1916,7 @@ int refine_split_families(CandidateList *cl, const Genome *genome,
         int new_idx = cl->num_families;
         CandidateFamily *new_fam = &cl->families[new_idx];
         memset(new_fam, 0, sizeof(CandidateFamily));
-        new_fam->id = (uid_t)new_idx;
+        new_fam->id = (mdl_uid_t)new_idx;
         new_fam->consensus = res->hi_cons;
         new_fam->consensus_length = res->hi_clen;
         new_fam->instances = res->hi_insts;
@@ -2860,7 +2860,7 @@ int refine_assemble_fragments(CandidateList *cl, const Genome *genome,
                 cl->families[i].consensus != NULL) {
                 if (write_idx != i)
                     cl->families[write_idx] = cl->families[i];
-                cl->families[write_idx].id = (uid_t)write_idx;
+                cl->families[write_idx].id = (mdl_uid_t)write_idx;
                 write_idx++;
             }
         }

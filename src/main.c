@@ -730,7 +730,7 @@ static CandidateList *discover_chunked(const Genome *genome,
         if (!cl) continue;
         for (int f = 0; f < cl->num_families; f++) {
             combined->families[write_idx] = cl->families[f];
-            combined->families[write_idx].id = (uid_t)write_idx;
+            combined->families[write_idx].id = (mdl_uid_t)write_idx;
             write_idx++;
         }
         /* Free the chunk CandidateList shell (but NOT the families' data,
@@ -1209,7 +1209,7 @@ int main(int argc, char *argv[])
             if (f->num_instances >= 2 && f->consensus_length >= min_final_consensus) {
                 if (write_idx != i)
                     candidates->families[write_idx] = candidates->families[i];
-                candidates->families[write_idx].id = (uid_t)write_idx;
+                candidates->families[write_idx].id = (mdl_uid_t)write_idx;
                 write_idx++;
             } else {
                 free(f->consensus);

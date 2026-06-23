@@ -9,7 +9,7 @@
 typedef int64_t gpos_t;    /* genome position */
 typedef int64_t glen_t;    /* genome/sequence length */
 typedef int32_t freq_t;    /* k-mer frequency (max ~1M for Alu, fits int32) */
-typedef int32_t uid_t;     /* unitig/family ID */
+typedef int32_t mdl_uid_t;     /* unitig/family ID */
 
 /* --- DNA encoding (matches RepeatScout convention) --- */
 #define DNA_A   0

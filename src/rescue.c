@@ -283,7 +283,7 @@ static int append_candidate_list(CandidateList *dst, CandidateList *src,
 
         CandidateFamily *out = &dst->families[dst->num_families];
         *out = src->families[i];
-        out->id = (uid_t)dst->num_families;
+        out->id = (mdl_uid_t)dst->num_families;
         out->discovery_flags |= discovery_flags;
         rescue_audit_write_candidate(rescue_audit_fp, "append", "kept",
                                      src->families[i].id, out->id,

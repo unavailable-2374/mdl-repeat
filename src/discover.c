@@ -1676,7 +1676,7 @@ CandidateList *discover_families(const Genome *genome,
             /* Create CandidateFamily */
             CandidateFamily *fam = &result->families[result->num_families];
             memset(fam, 0, sizeof(*fam));
-            fam->id = (uid_t)result->num_families;
+            fam->id = (mdl_uid_t)result->num_families;
 
             /* Copy consensus */
             fam->consensus = malloc(cons_len * sizeof(char));

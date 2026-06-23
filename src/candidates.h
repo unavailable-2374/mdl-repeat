@@ -75,7 +75,7 @@ typedef struct {
 
 /* A candidate repeat family */
 typedef struct {
-    uid_t    id;
+    mdl_uid_t    id;
     char    *consensus;       /* numeric bases (0/1/2/3) */
     int      consensus_length;
     int      component_id;
