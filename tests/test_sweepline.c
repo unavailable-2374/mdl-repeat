@@ -91,7 +91,7 @@ static void make_family(CandidateFamily *fam, int id, int cons_len,
                         int edits)
 {
     memset(fam, 0, sizeof(*fam));
-    fam->id = (uid_t)id;
+    fam->id = (mdl_uid_t)id;
     fam->consensus_length = cons_len;
     fam->consensus = calloc((size_t)cons_len, 1);
     fam->num_instances = n_inst;

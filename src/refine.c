@@ -2344,6 +2344,40 @@ static int cmp_int(const void *a, const void *b)
     return (ia > ib) - (ia < ib);
 }
 
+/* Hash a canonicalized (fam_a, fam_b) pair into a power-of-two table. */
+static inline unsigned coocc_pair_hash(int a, int b, int ht_size)
+{
+    return (((unsigned)a * 2654435761u) ^ ((unsigned)b * 40503u))
+           & (unsigned)(ht_size - 1);
+}
+
+/* Double the co-occurrence hash table and re-insert every existing pair.
+ * Returns 0 on success, -1 on allocation failure (caller aborts the sweep).
+ * Growing keeps the load factor bounded so probe chains stay O(1).  Without
+ * it the fixed table saturates on repeat-dense genomes (distinct family pairs
+ * far exceed the slot count): every lookup then scans the whole table and
+ * pairs beyond capacity are silently dropped — the root cause of the
+ * multi-hour assembly spin. */
+static int coocc_ht_grow(int **ht_p, int *ht_size_p,
+                         const CooccPair *pairs, int num_pairs)
+{
+    int new_size = *ht_size_p * 2;
+    int *nht = malloc((size_t)new_size * sizeof(int));
+    if (!nht) return -1;
+    for (int i = 0; i < new_size; i++) nht[i] = -1;
+    for (int p = 0; p < num_pairs; p++) {
+        unsigned h = coocc_pair_hash(pairs[p].fam_a, pairs[p].fam_b, new_size);
+        for (int probe = 0; probe < new_size; probe++) {
+            unsigned idx = (h + (unsigned)probe) & (unsigned)(new_size - 1);
+            if (nht[idx] == -1) { nht[idx] = p; break; }
+        }
+    }
+    free(*ht_p);
+    *ht_p = nht;
+    *ht_size_p = new_size;
+    return 0;
+}
+
 
 int refine_assemble_fragments(CandidateList *cl, const Genome *genome,
                               const KmerTable *kt, int k,
@@ -2432,14 +2466,26 @@ int refine_assemble_fragments(CandidateList *cl, const Genome *genome,
     CooccPair *pairs = calloc((size_t)cap_pairs, sizeof(CooccPair));
     if (!pairs) { free(entries); return 0; }
 
-    /* Hash table for pair lookup: map (fam_a, fam_b) -> index in pairs[] */
-    /* Simple open-addressing hash */
-    int ht_size = 16 * 1024;  /* must be power of 2 */
+    /* Hash table for pair lookup: map (fam_a, fam_b) -> index in pairs[].
+     * Open-addressing, power-of-two sized, and GROWN as pairs accumulate so
+     * the load factor stays bounded (see coocc_ht_grow for why a fixed table
+     * is the multi-hour-spin bug). */
+    int ht_size = 16 * 1024;  /* must stay a power of two */
     int *ht = malloc((size_t)ht_size * sizeof(int));
     if (!ht) { free(entries); free(pairs); return 0; }
-    memset(ht, -1, (size_t)ht_size * sizeof(int));
+    for (int t = 0; t < ht_size; t++) ht[t] = -1;
 
-    #define PAIR_HASH(a, b) (((unsigned)(a) * 2654435761u ^ (unsigned)(b) * 40503u) & (unsigned)(ht_size - 1))
+    if (verbose)
+        fprintf(stderr, "  Fragment assembly: co-occurrence sweep over %d "
+                "instances (D=%d bp)...\n", entries_count, D);
+
+    /* Work budget: the sweep is O(entries x window-density).  On pathological
+     * inputs (very many dense instances) the comparison count can explode;
+     * assembly is an optional MDL-gated enhancement, so past the budget we
+     * skip it with a diagnostic instead of spinning indefinitely. */
+    const int64_t SWEEP_BUDGET = 4000000000LL;
+    int64_t sweep_work = 0;
+    int sweep_aborted = 0;
 
     for (int i = 0; i < entries_count; i++) {
         int fa = entries[i].family_idx;
@@ -2448,6 +2494,18 @@ int refine_assemble_fragments(CandidateList *cl, const Genome *genome,
         for (int j = i + 1; j < entries_count; j++) {
             if (entries[j].seq_index != entries[i].seq_index) break;
             if (entries[j].start - entries[i].start > D) break;
+
+            if (++sweep_work > SWEEP_BUDGET) {
+                fprintf(stderr,
+                        "WARNING: fragment-assembly co-occurrence sweep exceeded "
+                        "its work budget (%lld comparisons over %d instances); "
+                        "skipping assembly for this run. Lower family/instance "
+                        "counts (e.g. -max-instances) if assembly is required.\n",
+                        (long long)SWEEP_BUDGET, entries_count);
+                sweep_aborted = 1;
+                goto sweep_done;
+            }
+
             int fb = entries[j].family_idx;
             if (fa == fb) continue;
 
@@ -2464,8 +2522,17 @@ int refine_assemble_fragments(CandidateList *cl, const Genome *genome,
             /* Check orientation consistency */
             int same_dir = (entries[i].strand == entries[j].strand);
 
+            /* Keep the table below ~70% load so probe chains stay short and
+             * an empty slot always exists (no silent drops). */
+            if ((int64_t)(num_pairs + 1) * 10 >= (int64_t)ht_size * 7) {
+                if (coocc_ht_grow(&ht, &ht_size, pairs, num_pairs) != 0) {
+                    sweep_aborted = 1;   /* OOM — abandon assembly safely */
+                    goto sweep_done;
+                }
+            }
+
             /* Find or create pair in hash table */
-            unsigned h = PAIR_HASH(pa, pb);
+            unsigned h = coocc_pair_hash(pa, pb, ht_size);
             int found = -1;
             for (int probe = 0; probe < ht_size; probe++) {
                 unsigned idx = (h + (unsigned)probe) & (unsigned)(ht_size - 1);
@@ -2506,8 +2573,14 @@ int refine_assemble_fragments(CandidateList *cl, const Genome *genome,
         }
     }
 
-    #undef PAIR_HASH
+sweep_done:
     free(ht);
+
+    if (sweep_aborted) {
+        free(entries);
+        free(pairs);
+        return 0;
+    }
 
     /* ---- Step 4: Classify pairs and filter ---- */
     /* Identify ADJACENT pairs for assembly (not NESTED) */
@@ -2534,6 +2607,21 @@ int refine_assemble_fragments(CandidateList *cl, const Genome *genome,
         CandidateFamily *fb = &cl->families[p->fam_b];
         int min_inst = fa->num_instances;
         if (fb->num_instances < min_inst) min_inst = fb->num_instances;
+
+        /* Co-occurrence FRACTION guard (#3 chimera): the absolute >=3 floor is
+         * trivially met by chance for high-copy families, which can fuse
+         * unrelated-but-adjacent TEs into a chimeric consensus.  Require a
+         * meaningful fraction of the smaller family's copies to co-occur. */
+        if (min_inst > 0 &&
+            (float)p->count < REFINE_ASSEMBLE_MIN_COOCC_FRAC * (float)min_inst) {
+            if (verbose >= 2)
+                fprintf(stderr, "  Assembly skip (low co-occ fraction): F%d/F%d "
+                        "count=%d / min_inst=%d (%.0f%% < %.0f%%)\n",
+                        fa->id, fb->id, p->count, min_inst,
+                        100.0f * (float)p->count / (float)min_inst,
+                        100.0f * REFINE_ASSEMBLE_MIN_COOCC_FRAC);
+            continue;
+        }
 
         if (min_inst > 0) {
             float frac_a_in_b = (float)p->a_inside_b / (float)min_inst;
@@ -2801,7 +2889,31 @@ int refine_assemble_fragments(CandidateList *cl, const Genome *genome,
         /* Score assembled family (no align_refine — use merged instances) */
         mdl_score_family(&assembled, genome_len, R_est - 1);
 
-        if (assembled.mdl_score <= sum_individual) {
+        /* Mean divergence of the merged instances (chimera-fit measure).
+         * Each merged instance carries its divergence against its own part
+         * consensus; a copy-weighted mean over all merged instances flags
+         * joins whose constituent copies fit poorly (chimera signature). */
+        double assembled_div_sum = 0.0;
+        for (int j = 0; j < merged_n; j++)
+            assembled_div_sum += merged_inst[j].divergence;
+        double assembled_mean_div =
+            (merged_n > 0) ? assembled_div_sum / (double)merged_n : 1.0;
+
+        /* Accept gate: the join must (a) beat the sum of parts in MDL,
+         * (b) yield a positive MDL score (so we never waste a slot on a join
+         * that selection would drop at mdl_score<=0), and (c) keep merged-copy
+         * divergence within the real-TE band — the volume-driven MDL gate alone
+         * passes high-copy chimeras with large positive scores. */
+        if (assembled.mdl_score <= sum_individual ||
+            assembled.mdl_score <= 0.0 ||
+            assembled_mean_div > REFINE_ASSEMBLE_MAX_DIV) {
+            if (verbose && assembled.mdl_score > sum_individual)
+                fprintf(stderr,
+                        "  Assembly REJECT F%d+F%d len=%d n=%d MDL=%.1f "
+                        "div=%.3f (gate: mdl>0 & div<=%.2f)\n",
+                        first_fam->id, second_fam->id, new_cons_len, merged_n,
+                        assembled.mdl_score, assembled_mean_div,
+                        REFINE_ASSEMBLE_MAX_DIV);
             free(assembled.consensus);
             free(assembled.instances);
             continue;
@@ -2818,6 +2930,8 @@ int refine_assemble_fragments(CandidateList *cl, const Genome *genome,
                     assembled.consensus_length, assembled.num_instances,
                     median_gap, fa->mdl_score, fb->mdl_score,
                     sum_individual, assembled.mdl_score);
+        if (verbose)
+            fprintf(stderr, "    (accepted div=%.3f)\n", assembled_mean_div);
 
         /* Replace fa with assembled, mark fb as absorbed */
         free(fa->consensus);
@@ -3011,4 +3125,46 @@ int refine_coalesce_tandem_instances(CandidateList *cl,
                 total_coalesced, total_families_affected);
     }
     return total_coalesced;
+}
+
+/* ================================================================
+ * Drop chimeric / over-extended long families (post-selection)
+ * ================================================================ */
+
+int refine_drop_chimeric_long(CandidateList *cl, int verbose)
+{
+    int dropped = 0;
+
+    for (int i = 0; i < cl->num_families; i++) {
+        CandidateFamily *f = &cl->families[i];
+        if (!candidate_is_accepted(f)) continue;
+        if (f->consensus_length < REFINE_CHIMERA_MIN_LEN) continue;
+        if (f->num_instances <= 0) continue;
+
+        /* Mean per-copy divergence against the consensus. For a long chimera or
+         * over-extension the copies match only a fragment, so the unmatched
+         * bulk scores as edits and mean divergence is high; a genuine long
+         * element is conserved and stays low. */
+        double sum = 0.0;
+        for (int j = 0; j < f->num_instances; j++)
+            sum += (double)f->instances[j].divergence;
+        double mean_div = sum / (double)f->num_instances;
+
+        if (mean_div > REFINE_CHIMERA_MAX_DIV) {
+            f->mdl.accept_state = CAND_ACCEPT_REJECTED;
+            dropped++;
+            if (verbose)
+                fprintf(stderr,
+                        "  drop chimeric-long F%d len=%d copies=%d mean_div=%.3f\n",
+                        f->id, f->consensus_length, f->num_instances, mean_div);
+        }
+    }
+
+    if (verbose)
+        fprintf(stderr,
+                "Chimera filter: dropped %d long high-divergence families "
+                "(len>=%d, div>%.2f)\n",
+                dropped, REFINE_CHIMERA_MIN_LEN, (double)REFINE_CHIMERA_MAX_DIV);
+
+    return dropped;
 }

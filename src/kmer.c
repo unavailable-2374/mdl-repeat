@@ -135,10 +135,11 @@ typedef struct {
     KmerTable      *kt;
     int             k;
     int             tandemdist;
-    glen_t          chunk_start;
-    glen_t          chunk_end;
+    glen_t          scan_start;      /* whole-genome scan range (shared) */
+    glen_t          scan_end;
+    int             thread_id;       /* this worker's id in [0, num_threads) */
+    int             num_threads;     /* total workers (for bucket ownership)  */
     KmerPool        local_pool;      /* per-thread pool */
-    pthread_mutex_t *stripe_locks;   /* shared stripe lock array */
     int             failed;          /* set to 1 on OOM */
 } KmerCountWorkerArgs;
 
@@ -149,8 +150,19 @@ static void *kmer_count_worker(void *arg)
     int tandemdist = a->tandemdist;
     KmerTable *kt = a->kt;
     size_t table_size = kt->table_size;
+    size_t nthreads = (size_t)a->num_threads;
+    size_t tid = (size_t)a->thread_id;
 
-    for (glen_t i = a->chunk_start; i < a->chunk_end; i++) {
+    /* Bucket-ownership parallelism (deterministic): every worker scans the
+     * WHOLE genome in coordinate order, but only processes k-mers whose bucket
+     * it exclusively owns (h % num_threads == thread_id). Because each bucket
+     * is touched by exactly one thread, and that thread visits the bucket's
+     * occurrences in ascending genome order, the order-dependent TANDEMDIST
+     * frequency filter and the bucket chain order are computed identically to
+     * the single-thread path — byte-for-byte reproducible, no locks. The cost
+     * is a redundant pack+hash per position per thread (cheap); the hash-table
+     * work is still partitioned 1/num_threads per thread. */
+    for (glen_t i = a->scan_start; i < a->scan_end; i++) {
         uint64_t fwd = kmer_pack(a->g->sequence + i, k);
         if (fwd == UINT64_MAX)
             continue;
@@ -160,11 +172,10 @@ static void *kmer_count_worker(void *arg)
         int is_reverse = (fwd > rc);
 
         size_t h = kmer_hash(canon, table_size);
-        size_t stripe = h % NUM_STRIPES;
+        if (h % nthreads != tid)
+            continue;  /* not my bucket — another worker owns it */
 
-        pthread_mutex_lock(&a->stripe_locks[stripe]);
-
-        /* Search for existing entry (under lock) */
+        /* Exclusive owner of this bucket: no lock needed. */
         KmerEntry *entry = kt->buckets[h];
         while (entry != NULL) {
             if (entry->kmer == canon)
@@ -187,7 +198,6 @@ static void *kmer_count_worker(void *arg)
             /* New k-mer: allocate from thread-local pool */
             entry = pool_alloc_local(&a->local_pool);
             if (entry == NULL) {
-                pthread_mutex_unlock(&a->stripe_locks[stripe]);
                 a->failed = 1;
                 return NULL;
             }
@@ -205,10 +215,10 @@ static void *kmer_count_worker(void *arg)
             entry->cap_positions = 0;
             entry->next = kt->buckets[h];
             kt->buckets[h] = entry;
+            /* Buckets are partitioned across threads, but num_entries is a
+             * single shared counter; atomic add keeps the total exact. */
             __atomic_fetch_add(&kt->num_entries, 1, __ATOMIC_RELAXED);
         }
-
-        pthread_mutex_unlock(&a->stripe_locks[stripe]);
     }
     return NULL;
 }
@@ -309,30 +319,17 @@ KmerTable *kmer_count(const Genome *g, int k, int tandemdist, int num_threads)
             }
         }
     } else {
-        /* ---- Parallel path: striped mutex locks + per-thread pools ---- */
-        fprintf(stderr, "  kmer counting: parallel with %d threads, %d stripe locks\n",
-                num_threads, NUM_STRIPES);
+        /* ---- Parallel path: bucket-ownership, lock-free, deterministic ---- */
+        fprintf(stderr, "  kmer counting: parallel with %d threads "
+                "(bucket-ownership, deterministic)\n", num_threads);
 
-        /* Allocate and initialize stripe locks */
-        pthread_mutex_t *stripe_locks = malloc(NUM_STRIPES * sizeof(pthread_mutex_t));
-        if (!stripe_locks) {
-            fprintf(stderr, "kmer_count: out of memory for stripe locks\n");
-            kmer_free(kt);
-            return NULL;
-        }
-        for (int s = 0; s < NUM_STRIPES; s++)
-            pthread_mutex_init(&stripe_locks[s], NULL);
-
-        /* Set up per-thread arguments */
-        glen_t range = end - PADLENGTH;
+        /* Set up per-thread arguments. Every worker scans the whole genome
+         * and processes only the buckets it owns (h %% num_threads == tid). */
         KmerCountWorkerArgs *args = calloc((size_t)num_threads,
                                            sizeof(KmerCountWorkerArgs));
         pthread_t *threads = malloc((size_t)num_threads * sizeof(pthread_t));
         if (!args || !threads) {
             free(args); free(threads);
-            for (int s = 0; s < NUM_STRIPES; s++)
-                pthread_mutex_destroy(&stripe_locks[s]);
-            free(stripe_locks);
             fprintf(stderr, "kmer_count: out of memory for thread args\n");
             kmer_free(kt);
             return NULL;
@@ -343,11 +340,12 @@ KmerTable *kmer_count(const Genome *g, int k, int tandemdist, int num_threads)
             args[t].kt = kt;
             args[t].k = k;
             args[t].tandemdist = tandemdist;
-            args[t].chunk_start = PADLENGTH + range * t / num_threads;
-            args[t].chunk_end   = PADLENGTH + range * (t + 1) / num_threads;
+            args[t].scan_start = PADLENGTH;
+            args[t].scan_end   = end;
+            args[t].thread_id  = t;
+            args[t].num_threads = num_threads;
             args[t].local_pool.head = NULL;
             args[t].local_pool.next_idx = POOL_BLOCK_SIZE;
-            args[t].stripe_locks = stripe_locks;
             args[t].failed = 0;
         }
 
@@ -376,10 +374,6 @@ KmerTable *kmer_count(const Genome *g, int k, int tandemdist, int num_threads)
         for (int t = 0; t < num_threads; t++)
             pool_merge(&args[t].local_pool);
 
-        /* Destroy stripe locks */
-        for (int s = 0; s < NUM_STRIPES; s++)
-            pthread_mutex_destroy(&stripe_locks[s]);
-        free(stripe_locks);
         free(threads);
         free(args);
 

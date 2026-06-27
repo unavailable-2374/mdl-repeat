@@ -57,6 +57,36 @@ extern const char *g_refine_split_audit_path;
 #define REFINE_BIMODALITY_THRESH  0.20f  /* min inter-class/total variance ratio */
 #define REFINE_DIV_BINS            100   /* histogram bins for Otsu's method */
 
+/* Fragment-assembly co-occurrence FRACTION guard (#3 chimera defense): on top
+ * of the absolute >=3 co-occurrence floor, require that this fraction of the
+ * smaller family's instances co-occur with the other family.  Blocks fusing
+ * unrelated-but-adjacent high-copy TEs (3-of-thousands is incidental); real
+ * fragments of one element co-occur in most copies. */
+#define REFINE_ASSEMBLE_MIN_COOCC_FRAC 0.20f
+
+/* Fragment-assembly divergence-quality guard (#4 chimera defense): the MDL
+ * "joined > sum-of-parts" gate is volume-driven — savings scale with copy
+ * count, so a chimeric join of two unrelated high-copy families passes with a
+ * large positive score while its "copies" fit the concatenated consensus
+ * poorly. A genuine assembly of two pieces of ONE element keeps per-copy
+ * divergence in the real-TE band (<= max-divergence 0.30); a chimera spikes to
+ * 0.4-0.8. Reject the join when the mean divergence of the merged instances
+ * exceeds this cap. Set just above the 0.30 refine max-divergence band. */
+#define REFINE_ASSEMBLE_MAX_DIV 0.35f
+
+/* Chimeric/over-extended long-family filter (post-selection cleanup).
+ * Long consensi (assembly chains, discovery over-extensions to the L-cap,
+ * coalesced tandems) whose copies fit the consensus poorly are chimeras: a
+ * genuine long element is conserved across copies (low mean divergence), while
+ * a chimera's "copies" only match a fragment, scoring high mean divergence (the
+ * unmatched bulk counts as edits — divergence here is the per-copy coverage
+ * signal in another guise). Length is only the SCOPE (high divergence is normal
+ * and harmless in short divergent families); the DECISION is divergence, not
+ * length. Empirically (TAIR10) this drops exactly the 40 kb+ chimeras and
+ * 20 kb-cap over-extensions with zero family-level recall change. */
+#define REFINE_CHIMERA_MIN_LEN 8000
+#define REFINE_CHIMERA_MAX_DIV 0.40f
+
 /*
  * Merge redundant families based on consensus similarity (80-80-80 rule).
  * Handles 5' truncation via semi-global alignment and checks both strands.
@@ -126,5 +156,15 @@ int refine_assemble_fragments(CandidateList *cl, const Genome *genome,
 int refine_coalesce_tandem_instances(CandidateList *cl,
                                      float coalesce_factor,
                                      int verbose);
+
+/*
+ * Drop accepted families that are long AND high-divergence — chimeric joins,
+ * discovery over-extensions to the L-cap, and coalesced tandems whose copies
+ * do not actually match the long consensus. Runs after MDL selection / prune
+ * (operates on accepted families; sets accept_state = REJECTED so output skips
+ * them). See REFINE_CHIMERA_MIN_LEN / REFINE_CHIMERA_MAX_DIV. Recall-neutral.
+ * Returns the number of families dropped.
+ */
+int refine_drop_chimeric_long(CandidateList *cl, int verbose);
 
 #endif /* MDL_REFINE_H */

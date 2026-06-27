@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <pthread.h>
 
 #include "discover_internal.h"
 #include "kmer.h"
@@ -325,135 +326,127 @@ static void build_headptr_internal(DiscoverContext *C, struct llist **headptr)
 }
 
 /* ================================================================
- * Hash table: parallel l-mer counting via kmer.c striped-lock hash
+ * Hash table: parallel l-mer counting via bucket-ownership
  *
- * Option γ adapter: replaces the O(N) serial scan in
- * build_headptr_internal with a parallel kmer_count() call, then
- * translates surviving KmerEntry records into the discover.c llist
- * structure expected by the rest of the pipeline.
+ * Faithfully reproduces build_headptr_internal's first-occurrence-
+ * anchored strand semantics in parallel. Every worker scans the whole
+ * forward copy in coordinate order, but only processes positions whose
+ * l-mer hashes to a bucket it exclusively owns (h % num_threads == tid).
+ * Because hash_function is RC-symmetric (an l-mer and its reverse
+ * complement share a bucket → the same owner), each owner sees all
+ * occurrences of its l-mers in genome order and evolves the per-entry
+ * state (freq, lastplusocc, lastminusocc, lastocc, chain order)
+ * byte-for-byte identically to the single-thread path — no locks, and
+ * output is independent of thread count.
  *
- * Scan range matches build_headptr_internal: only the forward copy
- * of the doubled genome ([PADLENGTH, orig_length)).
+ * (The previous adapter routed through kmer.c's canonical kmer_count,
+ * whose canonical-strand definition diverged from the serial first-
+ * occurrence anchor; that changed per-strand TANDEMDIST pruning and seed
+ * selection, made discovery thread-count-dependent, and cost recall.)
  * ================================================================ */
+
+typedef struct {
+    DiscoverContext *C;
+    struct llist   **headptr;
+    gpos_t           scan_start;
+    gpos_t           scan_end;     /* inclusive */
+    int              thread_id;
+    int              num_threads;
+} HeadptrWorkerArgs;
+
+static void *headptr_count_worker(void *arg)
+{
+    HeadptrWorkerArgs *a = (HeadptrWorkerArgs *)arg;
+    DiscoverContext *C = a->C;
+    struct llist **headptr = a->headptr;
+    int tid = a->thread_id;
+    int nthreads = a->num_threads;
+
+    for (gpos_t x = a->scan_start; x <= a->scan_end; x++) {
+        int h = hash_function(C, C->sequence + x);
+        if (h < 0) continue;
+        if (h % nthreads != tid) continue;   /* another worker owns this bucket */
+
+        /* Exclusive owner of bucket h — no lock needed. Body is an exact
+         * copy of build_headptr_internal's per-position logic. */
+        struct llist *tmp = headptr[h];
+        while (tmp != NULL) {
+            if (lmermatch(C, C->sequence + tmp->lastplusocc, C->sequence + x)) {
+                if (x - tmp->lastplusocc >= C->TANDEMDIST) tmp->freq++;
+                tmp->lastplusocc = x;
+                tmp->lastocc = x;
+                break;
+            } else if (lmermatchrc(C, C->sequence + tmp->lastplusocc, C->sequence + x)) {
+                if (x - tmp->lastminusocc >= C->TANDEMDIST) tmp->freq++;
+                tmp->lastminusocc = x;
+                tmp->lastocc = x;
+                break;
+            }
+            tmp = tmp->next;
+        }
+
+        if (tmp == NULL) {
+            /* New entry — apply entropy + periodicity filters */
+            if (compute_entropy(C, C->sequence + x) > C->MAXENTROPY) continue;
+            if (is_periodic_lmer(C->sequence + x, C->l)) continue;
+
+            tmp = malloc(sizeof(*tmp));
+            if (tmp == NULL) { fprintf(stderr, "discover: out of memory\n"); exit(1); }
+            tmp->freq = 1;
+            tmp->lastocc = x;
+            tmp->lastplusocc = x;
+            tmp->lastminusocc = -1000000;
+            tmp->next = headptr[h];
+            tmp->pos = NULL;
+            headptr[h] = tmp;
+        }
+    }
+    return NULL;
+}
 
 static void build_headptr_parallel(DiscoverContext *C,
                                    struct llist **headptr,
                                    int num_threads)
 {
-    int h;
-
-    for (h = 0; h < C->hash_size; h++)
+    for (int h = 0; h < C->hash_size; h++)
         headptr[h] = NULL;
 
-    /* Build a temporary Genome wrapping the forward (non-doubled) copy.
-     * kmer.c's kmer_count scans [PADLENGTH, length - k + 1), so length
-     * must be C->orig_length (NOT C->length which covers the RC copy). */
-    Genome tmp_genome;
-    memset(&tmp_genome, 0, sizeof(tmp_genome));
-    tmp_genome.sequence      = C->sequence_owned;
-    tmp_genome.length        = C->orig_length;
-    tmp_genome.raw_length    = C->orig_length - PADLENGTH;
-    tmp_genome.boundaries    = C->disc_boundaries;
-    tmp_genome.num_sequences = C->disc_num_sequences;
-    tmp_genome.sequence_ids  = NULL;
+    /* Scan range matches build_headptr_internal exactly. */
+    gpos_t count_end = C->orig_length - C->l;
 
-    KmerTable *kt = kmer_count(&tmp_genome, C->l, C->TANDEMDIST, num_threads);
-    if (kt == NULL) {
-        fprintf(stderr, "discover: parallel kmer_count failed\n");
-        exit(1);
+    HeadptrWorkerArgs *args = calloc((size_t)num_threads, sizeof(*args));
+    pthread_t *threads = malloc((size_t)num_threads * sizeof(*threads));
+    if (!args || !threads) {
+        free(args); free(threads);
+        fprintf(stderr, "discover: out of memory for headptr threads; "
+                "falling back to serial\n");
+        build_headptr_internal(C, headptr);
+        return;
     }
 
-    /* Decode buffer for unpacking 2-bit kmers back to 0-3 char[] */
-    char decoded[64];
-    if (C->l > 64) {
-        fprintf(stderr, "discover: l=%d exceeds decode buffer (64)\n", C->l);
-        kmer_free(kt);
-        exit(1);
+    for (int t = 0; t < num_threads; t++) {
+        args[t].C = C;
+        args[t].headptr = headptr;
+        args[t].scan_start = PADLENGTH;
+        args[t].scan_end = count_end;
+        args[t].thread_id = t;
+        args[t].num_threads = num_threads;
     }
 
-    for (size_t b = 0; b < kt->table_size; b++) {
-        KmerEntry *e = kt->buckets[b];
-        while (e != NULL) {
-            /* Skip below-threshold early to avoid pointless decode/alloc */
-            if (e->frequency < C->MINTHRESH) {
-                e = e->next;
-                continue;
-            }
-
-            /* Decode packed canonical kmer back to char[l] (0-3 encoding).
-             * MSB-first packing means the highest 2 bits encode index 0;
-             * unpack from index l-1 downward. Use a local copy so we
-             * don't mutate the entry. */
-            uint64_t k = e->kmer;
-            for (int i = C->l - 1; i >= 0; i--) {
-                decoded[i] = (char)(k & 3);
-                k >>= 2;
-            }
-
-            /* Apply discover-side filters that kmer.c does not know about.
-             * compute_entropy and is_periodic_lmer accept char[] in
-             * 0-3 encoding, exactly what we just produced. */
-            if (compute_entropy(C, decoded) > C->MAXENTROPY) {
-                e = e->next;
-                continue;
-            }
-            if (is_periodic_lmer(decoded, C->l)) {
-                e = e->next;
-                continue;
-            }
-
-            int hh = hash_function(C, decoded);
-            if (hh < 0) {
-                e = e->next;
-                continue;
-            }
-
-            /* Defensive: skip if already present in headptr[hh].
-             * kmer.c canonicalises and deduplicates, so this should
-             * not happen, but a stray hash collision via the asymmetric
-             * canonical forms could in principle produce one. */
-            struct llist *existing = headptr[hh];
-            int dup = 0;
-            while (existing != NULL) {
-                if (lmermatcheither(C, C->sequence + existing->lastocc, decoded)) {
-                    dup = 1;
-                    break;
-                }
-                existing = existing->next;
-            }
-            if (dup) {
-                e = e->next;
-                continue;
-            }
-
-            /* Choose lastocc: prefer plus, fall back to minus if plus is
-             * the sentinel (-1000000), in which case the kmer was only
-             * seen on the RC strand. */
-            gpos_t lastocc;
-            if (e->last_plus_occ >= PADLENGTH)
-                lastocc = e->last_plus_occ;
-            else
-                lastocc = e->last_minus_occ;
-
-            struct llist *node = malloc(sizeof(*node));
-            if (node == NULL) {
-                fprintf(stderr, "discover: out of memory in build_headptr_parallel\n");
-                kmer_free(kt);
-                exit(1);
-            }
-            node->freq         = e->frequency;
-            node->lastocc      = lastocc;
-            node->lastplusocc  = e->last_plus_occ;
-            node->lastminusocc = e->last_minus_occ;
-            node->pos          = NULL;
-            node->next         = headptr[hh];
-            headptr[hh] = node;
-
-            e = e->next;
-        }
+    int launched = 0;
+    for (int t = 0; t < num_threads; t++) {
+        if (pthread_create(&threads[t], NULL, headptr_count_worker, &args[t]) != 0)
+            break;
+        launched++;
     }
+    /* Any threads that failed to launch: run inline. */
+    for (int t = launched; t < num_threads; t++)
+        headptr_count_worker(&args[t]);
+    for (int t = 0; t < launched; t++)
+        pthread_join(threads[t], NULL);
 
-    kmer_free(kt);
+    free(threads);
+    free(args);
 }
 
 /* ================================================================
@@ -811,6 +804,25 @@ static int compute_score_left(DiscoverContext *C, int w, int n, int offset, char
  * (Exact port of RepeatScout lines 1722-1776)
  * ================================================================ */
 
+/* Active-occurrence gate against runaway extension (over-extension fix).
+ * The summed-score checkpoint advances as long as the total over all N copies
+ * keeps rising; with the per-copy CAPPENALTY floor (diverged copies contribute
+ * 0, never negative), a few spurious flanking matches keep nudging the total up
+ * on high-copy families, so the checkpoint runs past the true element boundary
+ * to the L cap, minting chimeric multi-kb consensi. nactiverepeatocc already
+ * counts copies still aligning above the cap floor (i.e. still "inside" the
+ * element). Require at least REPEAT_ACTIVE_FRAC of copies to be active before
+ * the checkpoint may advance. The max(2, frac*N) floor makes this strict for
+ * high-copy families (N=5000 -> 750 must still match) yet near-inert for genuine
+ * low-copy long elements (N=10 -> floor 2), which are the real full-length TEs. */
+#define REPEAT_ACTIVE_FRAC 0.15f
+
+static inline int repeat_active_floor(int N)
+{
+    int floor = (int)(REPEAT_ACTIVE_FRAC * (float)N);
+    return (floor < 2) ? 2 : floor;
+}
+
 static void compute_totalbestscore_right(DiscoverContext *C, int y)
 {
     int n, bestscore, offset;
@@ -841,9 +853,12 @@ static void compute_totalbestscore_right(DiscoverContext *C, int y)
         C->totalbestscore += bestscore;
     }
 
-    /* MINIMPROVEMENT checkpoint */
+    /* MINIMPROVEMENT checkpoint — gated on active-occurrence fraction so the
+     * checkpoint cannot advance into flanking sequence that only a few copies
+     * spuriously match (see REPEAT_ACTIVE_FRAC). */
     if ((C->totalbestscore >= C->besttotalbestscore + (y - C->besty) * C->MINIMPROVEMENT)
-        && (C->totalbestscore > C->besttotalbestscore)) {
+        && (C->totalbestscore > C->besttotalbestscore)
+        && (C->nactiverepeatocc >= repeat_active_floor(C->N))) {
         C->besty = y;
         C->besttotalbestscore = C->totalbestscore;
         C->bestnrepeatocc = C->nrepeatocc;
@@ -896,9 +911,11 @@ static void compute_totalbestscore_left(DiscoverContext *C, int w)
         C->totalbestscore += bestscore;
     }
 
-    /* MINIMPROVEMENT checkpoint — only save offsets, NOT scores/score_of_besty */
+    /* MINIMPROVEMENT checkpoint — only save offsets, NOT scores/score_of_besty.
+     * Active-occurrence gate mirrors extend_right (see REPEAT_ACTIVE_FRAC). */
     if ((C->totalbestscore >= C->besttotalbestscore + (C->bestw - w) * C->MINIMPROVEMENT)
-        && (C->totalbestscore > C->besttotalbestscore)) {
+        && (C->totalbestscore > C->besttotalbestscore)
+        && (C->nactiverepeatocc >= repeat_active_floor(C->N))) {
         C->bestw = w;
         C->besttotalbestscore = C->totalbestscore;
         C->bestnrepeatocc = C->nrepeatocc;
@@ -1658,7 +1675,9 @@ CandidateList *discover_families(const Genome *genome,
         if (cons_len >= C->GOODLENGTH) {
             /* Good family: save and collect instances */
             if (C->VERBOSE) {
-                fprintf(stderr, "discover: R=%d N=%d length=%d\n", C->R, C->N, cons_len);
+                fprintf(stderr, "discover: R=%d N=%d length=%d active=%d/%d(floor=%d)\n",
+                        C->R, C->N, cons_len, C->nactiverepeatocc, C->N,
+                        repeat_active_floor(C->N));
             }
 
             /* Grow result array if needed */

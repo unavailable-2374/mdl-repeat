@@ -809,7 +809,12 @@ static void usage(void)
         "  -refine-maxoffset # Refinement DP band half-width (default: 12, max: 32)\n"
         "  -max-dp-cells #    Max DP cells for consensus merge (default: 10000000)\n"
         "  -coalesce-factor # Gap tolerance for tandem-instance coalescing, in bases\n"
-        "                     (default: 20.0; 0 = disabled)\n\n"
+        "                     (default: 20.0; 0 = disabled)\n"
+        "  -max-instances #   Per-family recruited-instance cap (default: 10000).\n"
+        "                     Raise for genomes with extreme-copy families (e.g. Alu);\n"
+        "                     low caps truncate reported copies= and MDL savings.\n"
+        "  -max-seed-hits #   Raw seed-hit cap per family (default: 50000; auto-raised\n"
+        "                     to >= -max-instances)\n\n"
         "Optional (output):\n"
         "  -instances <file>  Output instance BED\n"
         "  -stats <file>      Output family statistics TSV\n"
@@ -1091,6 +1096,24 @@ int main(int argc, char *argv[])
     }
     if (co_get_int(argc, argv, "-refine-gap", &tmp_int))
         g_align_gap = tmp_int;
+    if (co_get_int(argc, argv, "-max-instances", &tmp_int)) {
+        if (tmp_int < 2) {
+            fprintf(stderr, "ERROR: -max-instances must be >= 2\n");
+            return 1;
+        }
+        g_align_max_instances = tmp_int;
+    }
+    if (co_get_int(argc, argv, "-max-seed-hits", &tmp_int)) {
+        if (tmp_int < 2) {
+            fprintf(stderr, "ERROR: -max-seed-hits must be >= 2\n");
+            return 1;
+        }
+        g_align_max_seed_hits = tmp_int;
+    }
+    /* Keep the seed-hit ceiling at least as large as the instance ceiling,
+     * otherwise raising -max-instances alone is throttled upstream. */
+    if (g_align_max_seed_hits < g_align_max_instances)
+        g_align_max_seed_hits = g_align_max_instances;
     if (co_get_int(argc, argv, "-refine-maxoffset", &tmp_int)) {
         if (tmp_int < 1 || tmp_int > ALIGN_MAXOFFSET_LIMIT) {
             fprintf(stderr, "ERROR: -refine-maxoffset must be in [1, %d]\n",
@@ -1267,6 +1290,13 @@ int main(int argc, char *argv[])
      * Step 6: Split families with bimodal divergence
      * ================================================================ */
     if (verbose) fprintf(stderr, "Splitting bimodal families...\n");
+    /* Single split pass. An iterated 4-pass variant was benchmarked and
+     * rejected: it produced no family-level recall gain while inflating the
+     * library ~22% and pushing the compression ratio above 1 (dl_library >
+     * total_savings). Cause: each extra Otsu pass mints overlapping sub-families
+     * that clear the relaxed split MDL gate, then enter the library via the
+     * standalone-fallback admit branch (mdl.c) carrying model_cost but ~zero
+     * exclusive savings. Keep this single-pass. */
     int n_splits = refine_split_families(candidates, genome, kt, k,
                                          genome->length, verbose,
                                          candidates->num_families,
@@ -1333,6 +1363,36 @@ int main(int argc, char *argv[])
     }
     /* Trace stage 08: coalesce — only accepted families */
     if (trace_dir) trace_dump_filtered(trace_dir, 8, "coalesce", candidates, genome, 1);
+
+    /* ================================================================
+     * Step 8c: Drop chimeric / over-extended long families
+     * Long + high-divergence consensi (assembly chains, discovery
+     * over-extensions to the L-cap, coalesced tandems) whose copies match only
+     * a fragment.  Runs last so it catches monsters from every upstream stage.
+     * Length is scope; divergence is the decision.  Recall-neutral.
+     * ================================================================ */
+    int n_chimeric = refine_drop_chimeric_long(candidates, verbose);
+    if (n_chimeric > 0)
+        fprintf(stderr, "Dropped %d chimeric/over-extended long families\n",
+                n_chimeric);
+
+    /* #1: warn if any accepted family is pinned at the instance ceiling — its
+     * reported copies= and MDL savings are truncated (the consensus itself is
+     * fine; it was built during discovery). This counts the precise condition
+     * (num_instances == cap), not mere seed-hit saturation. */
+    {
+        int n_capped = 0;
+        for (int fi = 0; fi < candidates->num_families; fi++)
+            if (candidates->families[fi].num_instances >= g_align_max_instances)
+                n_capped++;
+        if (n_capped > 0)
+            fprintf(stderr,
+                    "WARNING: %d famil%s at the instance cap "
+                    "(-max-instances=%d); their copies= and MDL savings are "
+                    "truncated. Raise -max-instances for extreme-copy families.\n",
+                    n_capped, n_capped == 1 ? "y is" : "ies are",
+                    g_align_max_instances);
+    }
 
     /* ================================================================
      * Step 9: Write outputs

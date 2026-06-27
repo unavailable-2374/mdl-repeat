@@ -21,6 +21,8 @@
 extern int   g_align_gap;            /* default: -5 */
 extern int   g_align_maxoffset;      /* default: 12, max: ALIGN_MAXOFFSET_LIMIT */
 extern float g_align_max_divergence; /* default: 0.30 */
+extern int   g_align_max_instances;  /* default: 10000 (per-family recruit cap) */
+extern int   g_align_max_seed_hits;  /* default: 50000 (raw seed-hit cap)       */
 
 /* Seed hit from multi-k-mer scanning */
 typedef struct {

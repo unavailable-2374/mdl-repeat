@@ -24,11 +24,16 @@ int   g_align_gap            = -5;
 int   g_align_maxoffset      = 12;
 float g_align_max_divergence = 0.30f;
 
+/* Recruitment caps, runtime-configurable (CLI: -max-instances / -max-seed-hits).
+ * Defaults match the former compile-time DEFAULT_MAXN / MAX_SEED_HITS. */
+int   g_align_max_instances  = 10000;  /* per-family recruited-instance ceiling   */
+int   g_align_max_seed_hits  = 50000;  /* raw seed-hit ceiling per family         */
+
 /* ================================================================
  * Internal constants
  * ================================================================ */
 
-#define MAX_SEED_HITS    50000   /* cap per-family seed hits */
+/* per-family seed-hit cap is now the runtime global g_align_max_seed_hits */
 #define MAX_CONS_KMERS   10000   /* cap consensus k-mer set entries */
 #define MAX_BAND_WIDTH   (2 * ALIGN_MAXOFFSET_LIMIT + 1)
 #define ALIGN_MAX_EXTENSION 10000  /* max bases to extend per direction per iteration */
@@ -602,17 +607,17 @@ int align_collect_instances(CandidateFamily *fam, const Genome *genome,
     if (fam->consensus_length < k) return 0;
 
     /* Step 1: Multi-k-mer genome scan */
-    SeedHit *hits = malloc((size_t)MAX_SEED_HITS * sizeof(SeedHit));
+    SeedHit *hits = malloc((size_t)g_align_max_seed_hits * sizeof(SeedHit));
     if (!hits) return 0;
 
-    int n_hits = seed_genome_scan(fam, kt, k, hits, MAX_SEED_HITS);
+    int n_hits = seed_genome_scan(fam, kt, k, hits, g_align_max_seed_hits);
     if (n_hits == 0) {
         free(hits);
         return 0;
     }
 
     /* Step 2: Cluster hits into candidate instances */
-    int max_anchors = DEFAULT_MAXN;
+    int max_anchors = g_align_max_instances;
     SeedHit *anchors = malloc((size_t)max_anchors * sizeof(SeedHit));
     if (!anchors) {
         free(hits);
@@ -630,7 +635,7 @@ int align_collect_instances(CandidateFamily *fam, const Genome *genome,
 
     /* Pre-allocate instance array */
     int cap = (n_anchors < 64) ? 64 : n_anchors;
-    if (cap > DEFAULT_MAXN) cap = DEFAULT_MAXN;
+    if (cap > g_align_max_instances) cap = g_align_max_instances;
     fam->instances = malloc((size_t)cap * sizeof(Instance));
     if (!fam->instances) {
         free(anchors);
@@ -651,7 +656,7 @@ int align_collect_instances(CandidateFamily *fam, const Genome *genome,
     int min_instance_len = (k + 10 > 30) ? (k + 10) : 30;
 
     /* Step 3: Banded alignment for each anchor */
-    for (int i = 0; i < n_anchors && fam->num_instances < DEFAULT_MAXN; i++) {
+    for (int i = 0; i < n_anchors && fam->num_instances < g_align_max_instances; i++) {
         AlignedInstance ai = align_banded(fam, genome, &anchors[i]);
         if (ai.score == INT_MIN) continue;
 
@@ -688,7 +693,7 @@ int align_collect_instances(CandidateFamily *fam, const Genome *genome,
         /* Grow array if needed */
         if (fam->num_instances >= fam->cap_instances) {
             int new_cap = fam->cap_instances * 2;
-            if (new_cap > DEFAULT_MAXN) new_cap = DEFAULT_MAXN;
+            if (new_cap > g_align_max_instances) new_cap = g_align_max_instances;
             Instance *tmp = realloc(fam->instances,
                                     (size_t)new_cap * sizeof(Instance));
             if (!tmp) break;
@@ -1311,7 +1316,7 @@ void align_refine_all(CandidateList *cl, const Genome *genome,
  */
 static int family_add_instance(CandidateFamily *fam, const Instance *inst)
 {
-    if (fam->num_instances >= DEFAULT_MAXN) return 0;
+    if (fam->num_instances >= g_align_max_instances) return 0;
 
     if (!fam->instances) {
         int cap = 64;
@@ -1323,7 +1328,7 @@ static int family_add_instance(CandidateFamily *fam, const Instance *inst)
 
     if (fam->num_instances >= fam->cap_instances) {
         int new_cap = fam->cap_instances * 2;
-        if (new_cap > DEFAULT_MAXN) new_cap = DEFAULT_MAXN;
+        if (new_cap > g_align_max_instances) new_cap = g_align_max_instances;
         Instance *tmp = realloc(fam->instances,
                                 (size_t)new_cap * sizeof(Instance));
         if (!tmp) return 0;
