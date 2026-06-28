@@ -912,15 +912,23 @@ int refine_merge_families(CandidateList *cl, const Genome *genome,
     int *representative = malloc((size_t)n * sizeof(int));
     if (!representative) { free(parent); free(uf_rank); return n_merges; }
 
-    /* Initialize: each family is its own representative */
+    /* Representative = the family in the component with the most instances,
+     * ties broken by LOWEST family index. The previous version initialized
+     * representative[root] = root and used a strict > (no replacement on tie),
+     * so an instance-count tie kept the union-find root as representative — and
+     * that root is set by union-by-rank in the order merge pairs are applied,
+     * which is nondeterministic under parallel pair collection. Indexing the
+     * tie-break on the root therefore made the chosen representative (hence the
+     * merged consensus) vary run-to-run. Iterating i in increasing order with a
+     * -1 sentinel makes the lowest-index max-instance family win, deterministically. */
     for (int i = 0; i < n; i++)
-        representative[i] = i;
+        representative[i] = -1;
 
-    /* Find representative for each group (most instances) */
     for (int i = 0; i < n; i++) {
         int root = uf_find(parent, i);
-        if (cl->families[i].num_instances >
-            cl->families[representative[root]].num_instances) {
+        int cur = representative[root];
+        if (cur < 0 ||
+            cl->families[i].num_instances > cl->families[cur].num_instances) {
             representative[root] = i;
         }
     }
@@ -960,26 +968,32 @@ int refine_merge_families(CandidateList *cl, const Genome *genome,
     }
 
     /* --- Step 5: Re-refine merged families --- */
+    /* Re-refine each component's representative iff it absorbed at least one
+     * other family. The decision is keyed only on `rep` (deterministic: the
+     * max-instance family of the component) and component membership — NOT on
+     * the union-find tree root. The root is set by union-by-rank in the order
+     * merge pairs are applied, which is nondeterministic under parallel pair
+     * collection; a former `i == root` guard therefore made *which* merged
+     * families got re-refined vary run-to-run, changing their rebuilt consensus
+     * (the downstream md5 nondeterminism). */
     for (int i = 0; i < n; i++) {
         int root = uf_find(parent, i);
         int rep = representative[root];
         if (i != rep) continue;
-        if (i == root && root == rep) {
-            /* Only re-refine if this family actually absorbed others */
-            int absorbed_any = 0;
-            for (int j = 0; j < n; j++) {
-                if (j != i && uf_find(parent, j) == root) {
-                    absorbed_any = 1;
-                    break;
-                }
+
+        int absorbed_any = 0;
+        for (int j = 0; j < n; j++) {
+            if (j != i && uf_find(parent, j) == root) {
+                absorbed_any = 1;
+                break;
             }
-            if (absorbed_any) {
-                if (verbose >= 2)
-                    fprintf(stderr, "  Re-refining merged F%d (n=%d)\n",
-                            cl->families[i].id, cl->families[i].num_instances);
-                align_refine_family(&cl->families[i], genome, kt, k,
-                                    ALIGN_MAX_ITERATIONS);
-            }
+        }
+        if (absorbed_any) {
+            if (verbose >= 2)
+                fprintf(stderr, "  Re-refining merged F%d (n=%d)\n",
+                        cl->families[i].id, cl->families[i].num_instances);
+            align_refine_family(&cl->families[i], genome, kt, k,
+                                ALIGN_MAX_ITERATIONS);
         }
     }
 
