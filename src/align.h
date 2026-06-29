@@ -104,6 +104,6 @@ void align_refine_all(CandidateList *cl, const Genome *genome,
  */
 int align_blast_recruit_short_families(CandidateList *cl,
                                         const Genome *genome, int k,
-                                        int verbose);
+                                        int num_threads, int verbose);
 
 #endif /* MDL_ALIGN_H */

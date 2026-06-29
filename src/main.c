@@ -792,6 +792,9 @@ static void usage(void)
         "  -maxoccurrences #  Max occurrences per seed (default: 10000)\n"
         "  -maxrepeats #      Max families to discover (default: 100000)\n"
         "  -recall-rescue    Run bounded secondary discovery with shorter l-mer seeds\n"
+        "  -recruit-short    Recruit extra instances for short families (<500 bp) via\n"
+        "                     rmblastn before selection (needs rmblastn in PATH or\n"
+        "                     $RMBLASTN_BIN); rescues divergent SINE/MITE families\n"
         "  -rescue-full-genome Run rescue discovery on the full genome instead of gaps\n"
         "  -rescue-l-delta # Shorten rescue l-mer length by N (default: 1, min l=8)\n"
         "  -rescue-maxrepeats # Max rescue families to append (default: 2000)\n"
@@ -848,6 +851,7 @@ int main(int argc, char *argv[])
     float coalesce_factor = 20.0f;
     ExternalToolsMode external_tools_mode = EXTERNAL_TOOLS_OFF;
     int recall_rescue = 0;
+    int recruit_short = 0;
     int rescue_full_genome = 0;
     int rescue_l_delta = 1;
     int rescue_maxrepeats = 2000;
@@ -903,6 +907,7 @@ int main(int argc, char *argv[])
     }
     g_refine_split_audit_path = split_audit_file;
     co_get_bool(argc, argv, "-recall-rescue", &recall_rescue);
+    co_get_bool(argc, argv, "-recruit-short", &recruit_short);
     co_get_bool(argc, argv, "-rescue-full-genome", &rescue_full_genome);
     if (co_has_option(argc, argv, "-rescue-l-delta") &&
         !co_get_int(argc, argv, "-rescue-l-delta", &rescue_l_delta)) {
@@ -1319,6 +1324,31 @@ int main(int argc, char *argv[])
     if (verbose && n_assembled > 0) candidates_print_stats(candidates);
     /* Trace stage 05: assemble */
     if (trace_dir) trace_dump(trace_dir, 5, "assemble", candidates, genome);
+
+    /* ================================================================
+     * Step 6c: Short-family RMBlast recruitment (opt-in, needs rmblastn)
+     * Banded-DP recruitment under-recruits divergent copies of SHORT elements
+     * (SINEs/MITEs/short fragments, <500 bp) — the dominant recall gap on
+     * TAIR10 (<500 bp families: 36% missed at 80x80 vs 4% for >=6 kb). rmblastn
+     * is far more sensitive for short divergent matches; this batch-recruits
+     * extra non-overlapping instances (div<=max-divergence gated, capped per
+     * family) so weakly-supported real short families clear the MDL/standalone
+     * admission gates instead of being pruned. Placed AFTER assembly so the
+     * boosted instance counts never feed the assembly sweep (the 12x-explosion
+     * that caused the 2026-05-01 revert lived in the bundled align_refine_all
+     * pre-pass, not here; the assembly SWEEP_BUDGET guard now backstops it too).
+     * ================================================================ */
+    if (recruit_short) {
+        if (verbose) fprintf(stderr, "Short-family RMBlast recruitment...\n");
+        int n_recruited = align_blast_recruit_short_families(candidates, genome,
+                                                             k, num_threads, verbose);
+        if (n_recruited < 0)
+            fprintf(stderr, "WARNING: -recruit-short requested but rmblastn "
+                    "not available (set $RMBLASTN_BIN or add to PATH); skipped.\n");
+        else
+            fprintf(stderr, "Short-family recruitment: added %d instances\n",
+                    n_recruited);
+    }
 
     /* ================================================================
      * Step 7: MDL scoring and library selection

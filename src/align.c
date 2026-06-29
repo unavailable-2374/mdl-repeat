@@ -1361,9 +1361,34 @@ static int instance_overlaps_existing(const CandidateFamily *fam,
     return 0;
 }
 
+/* One parsed rmblastn hit, staged so that hits can be sorted into a canonical
+ * order before instances are added. rmblastn with -num_threads emits hits in a
+ * nondeterministic order; the overlap de-dup below is order-sensitive (first
+ * hit wins), so without this sort the recruited instance set — and thus the
+ * output — would depend on thread scheduling. */
+typedef struct {
+    int      fam_idx;
+    Instance inst;
+} ShortHit;
+
+static int cmp_short_hit(const void *a, const void *b)
+{
+    const ShortHit *x = (const ShortHit *)a, *y = (const ShortHit *)b;
+    if (x->fam_idx != y->fam_idx) return (x->fam_idx < y->fam_idx) ? -1 : 1;
+    if (x->inst.position != y->inst.position)
+        return (x->inst.position < y->inst.position) ? -1 : 1;
+    if (x->inst.strand != y->inst.strand)
+        return (x->inst.strand < y->inst.strand) ? -1 : 1;
+    if (x->inst.score != y->inst.score)
+        return (x->inst.score > y->inst.score) ? -1 : 1;  /* higher score first */
+    if (x->inst.aligned_length != y->inst.aligned_length)
+        return (x->inst.aligned_length < y->inst.aligned_length) ? -1 : 1;
+    return 0;
+}
+
 int align_blast_recruit_short_families(CandidateList *cl,
                                         const Genome *genome, int k,
-                                        int verbose)
+                                        int num_threads, int verbose)
 {
     if (!rmblastn_available()) return -1;
 
@@ -1384,10 +1409,23 @@ int align_blast_recruit_short_families(CandidateList *cl,
 
     /* Build temp file paths */
     int pid = (int)getpid();
-    char query_fa[256], subj_fa[256], out_tab[256];
-    snprintf(query_fa, sizeof(query_fa), "/tmp/mdlr_batch_q_%d.fa",  pid);
-    snprintf(subj_fa,  sizeof(subj_fa),  "/tmp/mdlr_batch_s_%d.fa",  pid);
-    snprintf(out_tab,  sizeof(out_tab),  "/tmp/mdlr_batch_o_%d.tab", pid);
+    char query_fa[256], subj_fa[256], out_tab[256], db_prefix[256];
+    snprintf(query_fa,  sizeof(query_fa),  "/tmp/mdlr_batch_q_%d.fa",  pid);
+    snprintf(subj_fa,   sizeof(subj_fa),   "/tmp/mdlr_batch_s_%d.fa",  pid);
+    snprintf(out_tab,   sizeof(out_tab),   "/tmp/mdlr_batch_o_%d.tab", pid);
+    snprintf(db_prefix, sizeof(db_prefix), "/tmp/mdlr_batch_db_%d",    pid);
+
+    /* makeblastdb lives in the same bin dir as rmblastn. -subject mode does not
+     * parallelize under -num_threads, so build a BLAST DB and query with -db. */
+    char makeblastdb_path[256];
+    {
+        const char *slash = strrchr(g_rmblastn_path, '/');
+        if (slash)
+            snprintf(makeblastdb_path, sizeof(makeblastdb_path), "%.*smakeblastdb",
+                     (int)(slash - g_rmblastn_path + 1), g_rmblastn_path);
+        else
+            snprintf(makeblastdb_path, sizeof(makeblastdb_path), "makeblastdb");
+    }
 
     /* Map from genome sequence names to raw start offsets */
     int nseq = genome->num_sequences;
@@ -1397,9 +1435,17 @@ int align_blast_recruit_short_families(CandidateList *cl,
 
     int rc = -1;
 
-    /* Write genome subject FASTA */
+    /* Write genome FASTA, then build a BLAST DB from it (so -num_threads
+     * actually parallelizes — -subject mode does not). */
     if (write_genome_fasta(genome, subj_fa, seq_raw_starts, nseq) != 0)
         goto cleanup;
+    {
+        char dbcmd[1024];
+        snprintf(dbcmd, sizeof(dbcmd),
+                 "%s -in %s -dbtype nucl -out %s >/dev/null 2>&1",
+                 makeblastdb_path, subj_fa, db_prefix);
+        if (system(dbcmd) != 0) goto cleanup;
+    }
 
     /* Write multi-FASTA query: one record per short family.
      * Header format: >F<family_index>  (e.g., ">F42") */
@@ -1425,27 +1471,32 @@ int align_blast_recruit_short_families(CandidateList *cl,
     {
         char cmd[2048];
         snprintf(cmd, sizeof(cmd),
-                 "%s -task rmblastn -query %s -subject %s "
+                 "%s -task rmblastn -query %s -db %s "
                  "-outfmt \"6 qseqid sseqid sstart send pident length "
                  "qstart qend evalue sstrand\" "
                  "-word_size %d -perc_identity %.1f -qcov_hsp_perc %.1f "
                  "-gapopen %d -gapextend %d "
-                 "-max_hsps %d -dust no "
+                 "-max_hsps %d -dust no -num_threads %d "
                  "-out %s 2>/dev/null",
-                 g_rmblastn_path, query_fa, subj_fa,
+                 g_rmblastn_path, query_fa, db_prefix,
                  RMBLAST_WORD_SIZE, (double)RMBLAST_MIN_PIDENT,
                  (double)RMBLAST_MIN_QCOV_HSP,
                  RMBLAST_GAPOPEN, RMBLAST_GAPEXTEND, RMBLAST_MAX_HSPS,
+                 (num_threads > 0 ? num_threads : 1),
                  out_tab);
         system(cmd);  /* non-zero exit = no hits, not a hard error */
     }
 
-    /* Parse BLAST output and distribute hits to families */
+    /* Parse BLAST output into a candidate-instance array. Overlap de-dup is
+     * deferred to a second pass over the SORTED array, so the recruited set is
+     * independent of rmblastn's (threaded) output order. */
     FILE *fp = fopen(out_tab, "r");
     if (!fp) { rc = 0; goto cleanup; }
 
     char line[1024];
     int total_added = 0;
+    ShortHit *hits_arr = NULL;
+    size_t hits_n = 0, hits_cap = 0;
 
     while (fgets(line, sizeof(line), fp)) {
         /* Fields: qseqid sseqid sstart send pident length qstart qend evalue sstrand */
@@ -1511,26 +1562,41 @@ int align_blast_recruit_short_families(CandidateList *cl,
         float div = (float)((100.0 - pident) / 100.0);
         if (div > g_align_max_divergence) continue;
 
-        /* Skip if overlapping existing instance */
-        if (instance_overlaps_existing(fam, genome_start, genome_end)) continue;
+        if (hits_n >= hits_cap) {
+            size_t nc = hits_cap ? hits_cap * 2 : 4096;
+            ShortHit *tmp = realloc(hits_arr, nc * sizeof(ShortHit));
+            if (!tmp) break;  /* OOM: stop collecting, process what we have */
+            hits_arr = tmp; hits_cap = nc;
+        }
+        ShortHit *h = &hits_arr[hits_n++];
+        h->fam_idx             = fam_idx;
+        h->inst.position       = genome_start;
+        h->inst.aligned_length = alen;
+        h->inst.cons_start     = cons_start;
+        h->inst.cons_end       = cons_end;
+        h->inst.num_edits      = (int)(div * (float)length + 0.5f);
+        h->inst.divergence     = div;
+        h->inst.score          = (int)(pident / 100.0 * (double)length);
+        if (h->inst.score < 1) h->inst.score = 1;
+        h->inst.strand         = strand;
+        h->inst.seq_index      = genome_get_seq_index(genome, genome_start);
+    }
+    fclose(fp);
 
-        Instance inst;
-        inst.position       = genome_start;
-        inst.aligned_length = alen;
-        inst.cons_start     = cons_start;
-        inst.cons_end       = cons_end;
-        inst.num_edits      = (int)(div * (float)length + 0.5f);
-        inst.divergence     = div;
-        inst.score          = (int)(pident / 100.0 * (double)length);
-        if (inst.score < 1) inst.score = 1;
-        inst.strand         = strand;
-        inst.seq_index      = genome_get_seq_index(genome, genome_start);
+    /* Canonical sort → deterministic overlap de-dup independent of thread order. */
+    if (hits_n > 1)
+        qsort(hits_arr, hits_n, sizeof(ShortHit), cmp_short_hit);
 
-        if (family_add_instance(fam, &inst))
+    for (size_t hi = 0; hi < hits_n; hi++) {
+        ShortHit *h = &hits_arr[hi];
+        CandidateFamily *fam = &cl->families[h->fam_idx];
+        gpos_t gstart = h->inst.position;
+        gpos_t gend   = gstart + h->inst.aligned_length;
+        if (instance_overlaps_existing(fam, gstart, gend)) continue;
+        if (family_add_instance(fam, &h->inst))
             total_added++;
     }
-
-    fclose(fp);
+    free(hits_arr);
     rc = total_added;
 
     if (verbose)
@@ -1542,5 +1608,11 @@ cleanup:
     remove(query_fa);
     remove(subj_fa);
     remove(out_tab);
+    /* Remove the makeblastdb index files (db_prefix.n*) */
+    {
+        char rmdb[512];
+        snprintf(rmdb, sizeof(rmdb), "rm -f %s.n* >/dev/null 2>&1", db_prefix);
+        if (system(rmdb) != 0) { /* best-effort cleanup */ }
+    }
     return rc;
 }
