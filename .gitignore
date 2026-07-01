@@ -11,7 +11,6 @@ bin/
 
 # Claude Code internal
 .claude/
-CLAUDE.md
 
 # Test results (generated, not tracked)
 tests/results/
